@@ -401,6 +401,23 @@ run_container() {
         log_info ".env files not loaded (--ignore-dot-env flag set)"
     fi
 
+    # Build extra host entries from AGENTBOX_EXTRA_HOSTS
+    local host_args=()
+    local extra_hosts=""
+    if [[ -f "$agentbox_env" ]]; then
+        extra_hosts=$(grep -E '^AGENTBOX_EXTRA_HOSTS=' "$agentbox_env" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'" || true)
+    fi
+    if [[ -n "$extra_hosts" ]]; then
+        IFS=',' read -ra host_entries <<< "$extra_hosts"
+        for entry in "${host_entries[@]}"; do
+            entry=$(echo "$entry" | xargs)  # trim whitespace
+            if [[ -n "$entry" ]]; then
+                host_args+=(--add-host "$entry")
+                log_info "Extra host: $entry"
+            fi
+        done
+    fi
+
     # Build port forwarding arguments
     local port_args=()
     for port in "${ports[@]}"; do
@@ -429,6 +446,7 @@ run_container() {
         --name "$container_name" \
         --hostname "agentbox-$PROJECT_NAME" \
         "${runtime_args[@]}" \
+        "${host_args[@]}" \
         "${port_args[@]}" \
         "${mount_opts[@]}" \
         "${env_file_args[@]}" \
@@ -475,6 +493,10 @@ Examples:
     agentbox --rebuild                  # Force rebuild image
     agentbox ssh-init                   # Set up SSH for AgentBox
     AGENTBOX_TOOL=opencode agentbox     # Use env var to select tool
+
+Environment variables (set in ~/.agentbox/.env):
+    AGENTBOX_EXTRA_HOSTS    Comma-separated host:ip pairs added to container /etc/hosts
+                            Example: gitlab.example.com:host-gateway
 
 Containers are ephemeral and automatically removed when you exit.
 Package caches and shell history persist between sessions.

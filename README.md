@@ -146,6 +146,12 @@ Environment variables are loaded from `.env` files in this order (later override
 1. `~/.agentbox/.env` (global)
 2. `<project-dir>/.env` (project-specific)
 
+`AGENTBOX_EXTRA_HOSTS` (in `~/.agentbox/.env`) injects entries into the container's `/etc/hosts` via Docker's `--add-host`. Useful when the container needs to reach host-tunneled services:
+
+```bash
+AGENTBOX_EXTRA_HOSTS="gitlab.example.com:host-gateway"
+```
+
 AgentBox includes `direnv` support - `.envrc` files are evaluated if `direnv allow`ed on the host.
 
 ## MCP Server Configuration
