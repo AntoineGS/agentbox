@@ -164,7 +164,7 @@ expand_tilde() {
 
 has_path_traversal() {
     local path="$1"
-    [[ "$path" =~ \.\. ]]
+    [[ "$path" =~ (^|/)\.\.(/|$) ]]
 }
 
 is_absolute_path() {
@@ -263,7 +263,7 @@ mount_symlink_targets() {
             target=$(readlink -f "$entry" 2>/dev/null) || continue
 
             # Only mount if target is outside the directory (would be unreachable in container)
-            if [[ "$target" != "$dir_realpath"* ]]; then
+            if [[ "$target" != "$dir_realpath/"* ]]; then
                 if [[ -e "$target" ]]; then
                     symlink_mounts_ref+=(-v "$target:$target:z")
                     log_info "Symlink target mounted: $(basename "$entry") -> $target"
@@ -311,8 +311,8 @@ build_mount_opts() {
 
     local agentbox_ssh="${HOME}/.agentbox/ssh"
     if [[ -d "${agentbox_ssh}" ]]; then
-        mounts_ref+=(-v "${agentbox_ssh}:/home/agent/.ssh:rw")
-        log_info "AgentBox SSH directory mounted (read-write)"
+        mounts_ref+=(-v "${agentbox_ssh}:/home/agent/.ssh:ro")
+        log_info "AgentBox SSH directory mounted (read-only)"
     else
         log_warning "SSH not configured. Run 'agentbox ssh-init' to enable SSH operations."
     fi
@@ -379,7 +379,11 @@ build_container_cmd() {
 
     if [[ "$shell_mode" == "true" ]]; then
         if [[ "$admin_mode" == "true" ]]; then
-            cmd_ref=(bash -c "echo '🔒 Admin shell - sudo access enabled' && exec ${args[*]:-/bin/zsh}")
+            if [[ ${#args[@]} -gt 0 ]]; then
+                cmd_ref=(bash -c "echo '🔒 Admin shell - sudo access enabled' && exec \"\$@\"" -- "${args[@]}")
+            else
+                cmd_ref=(bash -c "echo '🔒 Admin shell - sudo access enabled' && exec /bin/zsh")
+            fi
         else
             cmd_ref=("${args[@]:-/bin/zsh}")
         fi

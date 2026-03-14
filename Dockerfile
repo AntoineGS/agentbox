@@ -33,8 +33,6 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         # Python build dependencies
         python3-dev python3-pip python3-venv \
         libssl-dev libffi-dev \
-        # Java dependencies
-        default-jdk maven gradle \
         # Go
         golang \
         # Lua
@@ -87,22 +85,18 @@ WORKDIR /home/${USERNAME}
 
 # Install Rust via rustup (includes cargo, rustfmt, clippy)
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable && \
-    echo 'source "$HOME/.cargo/env"' >> ~/.bashrc && \
-    echo 'source "$HOME/.cargo/env"' >> ~/.zshrc
+    echo 'source "$HOME/.cargo/env"' >> ~/.bashrc
 
 # Setup Go paths
 ENV GOPATH="/home/${USERNAME}/go"
 ENV PATH="${GOPATH}/bin:/usr/lib/go/bin:${PATH}"
 RUN mkdir -p "$GOPATH/bin" && \
     echo 'export GOPATH="$HOME/go"' >> ~/.bashrc && \
-    echo 'export PATH="$GOPATH/bin:$PATH"' >> ~/.bashrc && \
-    echo 'export GOPATH="$HOME/go"' >> ~/.zshrc && \
-    echo 'export PATH="$GOPATH/bin:$PATH"' >> ~/.zshrc
+    echo 'export PATH="$GOPATH/bin:$PATH"' >> ~/.bashrc
 
 # Install uv for Python package management
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
-    echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc && \
-    echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
+    echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
 
 # Install Node.js via NVM
 ENV NVM_DIR="/home/${USERNAME}/.nvm"
@@ -134,9 +128,9 @@ RUN bash -c "source $NVM_DIR/nvm.sh && \
 # Install SDKMAN for Java toolchain management
 RUN curl -s "https://get.sdkman.io?rcupdate=false" | bash && \
     echo 'source "$HOME/.sdkman/bin/sdkman-init.sh"' >> ~/.bashrc && \
-    echo 'source "$HOME/.sdkman/bin/sdkman-init.sh"' >> ~/.zshrc && \
     bash -c "source $HOME/.sdkman/bin/sdkman-init.sh && \
         sdk install java 21.0.9-tem && \
+        sdk install maven && \
         sdk install gradle"
 
 # Setup Python tools
@@ -158,13 +152,16 @@ RUN curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/i
 # Install Lua linters/formatters
 RUN luarocks install --local luacheck && \
     . "$HOME/.cargo/env" && cargo install stylua && \
-    echo 'export PATH="$HOME/.luarocks/bin:$PATH"' >> ~/.bashrc && \
-    echo 'export PATH="$HOME/.luarocks/bin:$PATH"' >> ~/.zshrc
+    echo 'export PATH="$HOME/.luarocks/bin:$PATH"' >> ~/.bashrc
 
-# Install oh-my-zsh for better shell experience and setup NVM for zsh
+# Install oh-my-zsh and configure .zshrc with all tool paths
+# oh-my-zsh replaces .zshrc, so ALL zsh-specific appends must go here
 RUN sh -c "$(wget -O- https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended && \
     sed -i 's/ZSH_THEME=".*"/ZSH_THEME="robbyrussell"/' ~/.zshrc && \
-    echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc && \
+    echo 'source "$HOME/.cargo/env"' >> ~/.zshrc && \
+    echo 'export GOPATH="$HOME/go"' >> ~/.zshrc && \
+    echo 'export PATH="$GOPATH/bin:$HOME/.local/bin:$HOME/.luarocks/bin:$PATH"' >> ~/.zshrc && \
+    echo 'source "$HOME/.sdkman/bin/sdkman-init.sh"' >> ~/.zshrc && \
     echo 'export NVM_DIR="$HOME/.nvm"' >> ~/.zshrc && \
     echo '[ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"' >> ~/.zshrc && \
     echo '[ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"' >> ~/.zshrc

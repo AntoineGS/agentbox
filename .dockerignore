@@ -1,0 +1,11 @@
+.git
+.github
+.full-review
+.claude
+media
+docs
+*.md
+LICENSE
+.gitignore
+.dockerignore
+parallel-claude.sh
