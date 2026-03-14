@@ -4,6 +4,12 @@ set -e
 
 export PATH="$HOME/.opencode/bin:$HOME/.local/bin:$PATH"
 
+if [ -n "${HOST_HOME:-}" ] && [ "$HOST_HOME" != "$HOME" ] && [ ! -e "$HOST_HOME/.claude" ]; then
+    sudo mkdir -p "$HOST_HOME" 2>/dev/null || true
+    sudo ln -s "$HOME/.claude" "$HOST_HOME/.claude" 2>/dev/null && \
+        echo "✅ Symlinked $HOST_HOME/.claude -> $HOME/.claude for plugin path resolution"
+fi
+
 if [ -s "$HOME/.nvm/nvm.sh" ]; then
     export NVM_DIR="$HOME/.nvm"
     source "$NVM_DIR/nvm.sh"
@@ -52,6 +58,9 @@ fi
 if [ -n "$PROJECT_DIR" ] && { [ -f "$PROJECT_DIR/.mcp.json" ] || [ -f "$PROJECT_DIR/mcp.json" ]; }; then
     echo "🔌 MCP configuration detected. To enable MCP servers, see AgentBox documentation."
 fi
+
+# Update Claude Code to latest version
+curl -fsSL https://claude.ai/install.sh 2>/dev/null | bash -s -- -y 2>/dev/null && echo "✅ Claude Code updated" || true
 
 export TERM=xterm-256color
 

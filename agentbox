@@ -74,11 +74,15 @@ calculate_hash() {
 }
 
 # Get container name for current project
-get_container_name() {
-    local project_hash=$(echo -n "$PROJECT_DIR" | sha256sum | cut -c1-12)
-    echo "${CONTAINER_PREFIX}-${project_hash}"
+get_project_id() {
+    echo -n "$PROJECT_DIR" | sha256sum | cut -c1-12
 }
 
+get_container_name() {
+    local project_id="$1"
+    local random_suffix=$(head -c4 /dev/urandom | xxd -p)
+    echo "${CONTAINER_PREFIX}-${project_id}-${random_suffix}"
+}
 
 # Check if image needs rebuild
 needs_rebuild() {
@@ -99,6 +103,18 @@ needs_rebuild() {
     # Compare hashes
     if [[ "$combined_hash" != "$stored_hash" ]]; then
         return 0  # Needs rebuild
+    fi
+
+    # Rebuild if image is older than 48 hours to get latest tool versions
+    local built_at=$($RUNTIME inspect "$IMAGE_NAME" \
+        --format '{{ index .Config.Labels "agentbox.built" }}' 2>/dev/null || echo "")
+    if [[ -n "$built_at" ]]; then
+        local built_ts=$(date -d "$built_at" +%s 2>/dev/null || echo 0)
+        local now_ts=$(date +%s)
+        local age_hours=$(( (now_ts - built_ts) / 3600 ))
+        if (( age_hours >= 48 )); then
+            return 0  # Needs rebuild - image too old
+        fi
     fi
 
     return 1  # No rebuild needed
@@ -122,7 +138,7 @@ build_image() {
         --build-arg USER_ID="${user_id}" \
         --build-arg GROUP_ID="${group_id}" \
         --build-arg USERNAME="agent" \
-        --build-arg BUILD_TIMESTAMP=${build_timestamp} \
+        --build-arg BUILD_TIMESTAMP="${build_timestamp}" \
         --label "agentbox.hash=${combined_hash}" \
         --label "agentbox.version=1.0.0" \
         --label "agentbox.built=${build_timestamp}" \
@@ -229,6 +245,36 @@ validate_dir_path() {
     return 0
 }
 
+# Mount symlink targets from a directory so symlinks resolve inside the container
+mount_symlink_targets() {
+    local dir="$1"
+    local -n symlink_mounts_ref=$2
+
+    if [[ ! -d "$dir" ]]; then
+        return 0
+    fi
+
+    local dir_realpath
+    dir_realpath=$(realpath "$dir")
+
+    for entry in "$dir"/*; do
+        if [[ -L "$entry" ]]; then
+            local target
+            target=$(readlink -f "$entry" 2>/dev/null) || continue
+
+            # Only mount if target is outside the directory (would be unreachable in container)
+            if [[ "$target" != "$dir_realpath"* ]]; then
+                if [[ -e "$target" ]]; then
+                    symlink_mounts_ref+=(-v "$target:$target:z")
+                    log_info "Symlink target mounted: $(basename "$entry") -> $target"
+                else
+                    log_warning "Symlink target not found: $(basename "$entry") -> $target"
+                fi
+            fi
+        fi
+    done
+}
+
 # Mount additional dirs to Docker mount options
 mount_additional_dirs() {
     local -n mount_opts_ref=$1
@@ -246,27 +292,192 @@ mount_additional_dirs() {
     done
 }
 
-# Run container with --rm (ephemeral)
-run_container() {
-    local container_name="$1"
-    local -n extra_dirs_to_mount=$2
+build_mount_opts() {
+    local -n mounts_ref=$1
+    local project_id="$2"
     local tool="$3"
-    local ignore_dot_env="$4"
-    shift 4
+    local -n dirs_ref=$4
 
-    # Check if first arg is "shell" mode
-    local shell_mode=false
-    local admin_mode=false
-    if [[ "${1:-}" == "shell" ]]; then
-        shell_mode=true
-        shift
-        # Check if next arg is --admin
-        if [[ "${1:-}" == "--admin" ]]; then
-            admin_mode=true
-            shift
-        fi
+    mounts_ref=(
+        -v "$PROJECT_DIR:$PROJECT_DIR:z"
+        --env "PROJECT_DIR=$PROJECT_DIR"
+    )
+
+    mount_additional_dirs mounts_ref "${dirs_ref[@]}"
+
+    if [[ -f "${HOME}/.gitconfig" ]]; then
+        mounts_ref+=(-v "${HOME}/.gitconfig:/tmp/host_gitconfig:ro")
     fi
 
+    local agentbox_ssh="${HOME}/.agentbox/ssh"
+    if [[ -d "${agentbox_ssh}" ]]; then
+        mounts_ref+=(-v "${agentbox_ssh}:/home/agent/.ssh:rw")
+        log_info "AgentBox SSH directory mounted (read-write)"
+    else
+        log_warning "SSH not configured. Run 'agentbox ssh-init' to enable SSH operations."
+    fi
+
+    local cache_dir="${HOME}/.cache/agentbox/${project_id}"
+    mkdir -p "${cache_dir}/npm" "${cache_dir}/pip" "${cache_dir}/maven" "${cache_dir}/gradle"
+
+    mounts_ref+=(
+        -v "${cache_dir}/npm:/home/agent/.npm"
+        -v "${cache_dir}/pip:/home/agent/.cache/pip"
+        -v "${cache_dir}/maven:/home/agent/.m2"
+        -v "${cache_dir}/gradle:/home/agent/.gradle"
+    )
+
+    local history_dir="${HOME}/.agentbox/projects/${project_id}/history"
+    mkdir -p "${history_dir}"
+
+    mounts_ref+=(
+        -v "${history_dir}:/home/agent/.shell_history"
+        --env "HISTFILE=/home/agent/.shell_history/zsh_history"
+    )
+
+    if [[ "$tool" == "opencode" ]]; then
+        local opencode_config_dir="${HOME}/.config/opencode"
+        local opencode_auth_dir="${HOME}/.local/share/opencode"
+        mkdir -p "$opencode_config_dir" "$opencode_auth_dir"
+
+        mounts_ref+=(
+            -v "${opencode_config_dir}:/home/agent/.config/opencode"
+            -v "${opencode_auth_dir}:/home/agent/.local/share/opencode"
+        )
+        log_info "OpenCode configuration and auth mounted"
+    else
+        local claude_dir="${HOME}/.claude"
+        mkdir -p "$claude_dir"
+
+        mounts_ref+=(
+            -v "${claude_dir}:/home/agent/.claude"
+            --env "CLAUDE_CONFIG_DIR=/home/agent/.claude"
+            --env "HOST_HOME=${HOME}"
+        )
+        mount_symlink_targets "$claude_dir" mounts_ref
+        log_info "Claude CLI configuration mounted"
+    fi
+
+    mounts_ref+=(--env "TOOL=$tool")
+
+    if [[ -f "$PROJECT_DIR/.envrc" ]]; then
+        local host_direnv_allow="${HOME}/.local/share/direnv/allow"
+        if [[ -d "$host_direnv_allow" ]]; then
+            mounts_ref+=(-v "${host_direnv_allow}:/tmp/host_direnv_allow:ro")
+            log_info "Host direnv approvals will be translated to container"
+        fi
+    fi
+}
+
+build_container_cmd() {
+    local -n cmd_ref=$1
+    local shell_mode="$2"
+    local admin_mode="$3"
+    local tool="$4"
+    shift 4
+    local args=("$@")
+
+    if [[ "$shell_mode" == "true" ]]; then
+        if [[ "$admin_mode" == "true" ]]; then
+            cmd_ref=(bash -c "echo '🔒 Admin shell - sudo access enabled' && exec ${args[*]:-/bin/zsh}")
+        else
+            cmd_ref=("${args[@]:-/bin/zsh}")
+        fi
+        return
+    fi
+
+    local tool_cmd
+    if [[ "$tool" == "opencode" ]]; then
+        tool_cmd="opencode"
+    else
+        tool_cmd="claude --dangerously-skip-permissions"
+    fi
+
+    if [[ ${#args[@]} -gt 0 ]]; then
+        local escaped_args=""
+        for arg in "${args[@]}"; do
+            escaped_args+=" $(printf '%q' "$arg")"
+        done
+        tool_cmd="$tool_cmd$escaped_args"
+    fi
+    cmd_ref=(zsh -c "source ~/.zshrc && exec $tool_cmd")
+}
+
+build_env_file_args() {
+    local -n env_args_ref=$1
+    local ignore_dot_env="$2"
+
+    env_args_ref=()
+    if [[ "$ignore_dot_env" == "true" ]]; then
+        log_info ".env files not loaded (--ignore-dot-env flag set)"
+        return
+    fi
+
+    local agentbox_env="${HOME}/.agentbox/.env"
+    if [[ -f "$agentbox_env" ]]; then
+        env_args_ref+=(--env-file "$agentbox_env")
+        log_info "Global .env loaded from ~/.agentbox/.env"
+    fi
+
+    if [[ -f "$PROJECT_DIR/.env" ]]; then
+        env_args_ref+=(--env-file "$PROJECT_DIR/.env")
+        log_info "Project .env loaded from $PROJECT_DIR/.env"
+    fi
+}
+
+build_extra_host_args() {
+    local -n host_args_ref=$1
+
+    host_args_ref=()
+    local agentbox_env="${HOME}/.agentbox/.env"
+    if [[ ! -f "$agentbox_env" ]]; then
+        return
+    fi
+
+    local extra_hosts
+    extra_hosts=$(grep -E '^AGENTBOX_EXTRA_HOSTS=' "$agentbox_env" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'" || true)
+    if [[ -z "$extra_hosts" ]]; then
+        return
+    fi
+
+    IFS=',' read -ra host_entries <<< "$extra_hosts"
+    for entry in "${host_entries[@]}"; do
+        entry=$(echo "$entry" | xargs)
+        if [[ -n "$entry" ]]; then
+            host_args_ref+=(--add-host "$entry")
+            log_info "Extra host: $entry"
+        fi
+    done
+}
+
+build_port_args() {
+    local -n port_args_ref=$1
+    local -n ports_ref=$2
+
+    port_args_ref=()
+    for port in "${ports_ref[@]}"; do
+        if [[ "$port" =~ ^[0-9]+$ ]]; then
+            port_args_ref+=(-p "${port}:${port}")
+            log_info "Port forwarding: ${port} -> ${port}"
+        elif [[ "$port" =~ ^[0-9]+:[0-9]+$ ]]; then
+            port_args_ref+=(-p "${port}")
+            log_info "Port forwarding: ${port}"
+        else
+            log_warning "Invalid port format: ${port} (use '3002' or '3002:8080')"
+        fi
+    done
+}
+
+run_container() {
+    local container_name="$1"
+    local project_id="$2"
+    local -n extra_dirs_to_mount=$3
+    local tool="$4"
+    local ignore_dot_env="$5"
+    local shell_mode="$6"
+    local admin_mode="$7"
+    local -n ports_to_forward=$8
+    shift 8
     local cmd_args=("$@")
 
     if [[ "$admin_mode" == "true" ]]; then
@@ -275,173 +486,26 @@ run_container() {
         log_success "Starting container for: $PROJECT_NAME"
     fi
 
-    # Prepare mount options - mount project at its real host path
-    local mount_opts=(
-        -v "$PROJECT_DIR:$PROJECT_DIR:z"
-        --env "PROJECT_DIR=$PROJECT_DIR"
-    )
+    local mount_opts=()
+    build_mount_opts mount_opts "$project_id" "$tool" extra_dirs_to_mount
 
-    mount_additional_dirs mount_opts "${extra_dirs_to_mount[@]}"
-
-    # Mount .gitconfig to temp location for copying (if it exists)
-    if [[ -f "${HOME}/.gitconfig" ]]; then
-        mount_opts+=(-v "${HOME}/.gitconfig:/tmp/host_gitconfig:ro")
-    fi
-
-    # Mount dedicated AgentBox SSH directory
-    local agentbox_ssh="${HOME}/.agentbox/ssh"
-    if [[ -d "${agentbox_ssh}" ]]; then
-        mount_opts+=(-v "${agentbox_ssh}:/home/agent/.ssh:rw")
-        log_info "AgentBox SSH directory mounted (read-write)"
-    else
-        log_warning "SSH not configured. Run 'agentbox ssh-init' to enable SSH operations."
-    fi
-
-    # Mount cache directories for package managers
-    local cache_dir="${HOME}/.cache/agentbox/${container_name}"
-    mkdir -p "${cache_dir}/npm" "${cache_dir}/pip" "${cache_dir}/maven" "${cache_dir}/gradle"
-
-    mount_opts+=(
-        -v "${cache_dir}/npm:/home/agent/.npm"
-        -v "${cache_dir}/pip:/home/agent/.cache/pip"
-        -v "${cache_dir}/maven:/home/agent/.m2"
-        -v "${cache_dir}/gradle:/home/agent/.gradle"
-    )
-
-    # Mount per-project persistent data
-    local project_data_dir="${HOME}/.agentbox/projects/${container_name}"
-    local history_dir="${project_data_dir}/history"
-    mkdir -p "${history_dir}"
-
-    # Mount history directory (not individual files to avoid file locking issues)
-    mount_opts+=(
-        -v "${history_dir}:/home/agent/.shell_history"
-        --env "HISTFILE=/home/agent/.shell_history/zsh_history"
-    )
-
-    if [[ "$tool" == "opencode" ]]; then
-        local opencode_config_dir="${HOME}/.config/opencode"
-        local opencode_auth_dir="${HOME}/.local/share/opencode"
-
-        mkdir -p "$opencode_config_dir"
-        mkdir -p "$opencode_auth_dir"
-
-        mount_opts+=(
-            -v "${opencode_config_dir}:/home/agent/.config/opencode"
-            -v "${opencode_auth_dir}:/home/agent/.local/share/opencode"
-        )
-
-        log_info "OpenCode configuration and auth mounted"
-    else
-        local claude_dir="${HOME}/.claude"
-
-        mkdir -p "$claude_dir"
-
-        mount_opts+=(
-            -v "${claude_dir}:/home/agent/.claude"
-            --env "CLAUDE_CONFIG_DIR=/home/agent/.claude"
-        )
-
-        log_info "Claude CLI configuration mounted"
-    fi
-
-    # Set tool environment variable
-    mount_opts+=(--env "TOOL=$tool")
-
-    # Mount host direnv approvals for translation if project has .envrc
-    if [[ -f "$PROJECT_DIR/.envrc" ]]; then
-        local host_direnv_allow="${HOME}/.local/share/direnv/allow"
-        if [[ -d "$host_direnv_allow" ]]; then
-            mount_opts+=(-v "${host_direnv_allow}:/tmp/host_direnv_allow:ro")
-            log_info "Host direnv approvals will be translated to container"
-        fi
-    fi
-
-    # Prepare the command to run
-    local container_cmd
-    if [[ "$shell_mode" == "true" ]]; then
-        if [[ "$admin_mode" == "true" ]]; then
-            container_cmd=(bash -c "echo '🔒 Admin shell - sudo access enabled' && exec ${cmd_args[*]:-/bin/zsh}")
-        else
-            container_cmd=("${cmd_args[@]:-/bin/zsh}")
-        fi
-    else
-        # Run tool through zsh to get proper environment
-        local tool_cmd
-        if [[ "$tool" == "opencode" ]]; then
-            tool_cmd="opencode"
-        else
-            tool_cmd="claude --dangerously-skip-permissions"
-        fi
-
-        if [[ ${#cmd_args[@]} -gt 0 ]]; then
-            # Properly escape each argument to preserve quoting
-            local escaped_args=""
-            for arg in "${cmd_args[@]}"; do
-                escaped_args+=" $(printf '%q' "$arg")"
-            done
-            tool_cmd="$tool_cmd$escaped_args"
-        fi
-        container_cmd=(zsh -c "source ~/.zshrc && exec $tool_cmd")
-    fi
+    local container_cmd=()
+    build_container_cmd container_cmd "$shell_mode" "$admin_mode" "$tool" "${cmd_args[@]}"
 
     local env_file_args=()
-    if [[ "$ignore_dot_env" != "true" ]]; then
-        local agentbox_env="${HOME}/.agentbox/.env"
-        if [[ -f "$agentbox_env" ]]; then
-            env_file_args+=(--env-file "$agentbox_env")
-            log_info "Global .env loaded from ~/.agentbox/.env"
-        fi
+    build_env_file_args env_file_args "$ignore_dot_env"
 
-        if [[ -f "$PROJECT_DIR/.env" ]]; then
-            env_file_args+=(--env-file "$PROJECT_DIR/.env")
-            log_info "Project .env loaded from $PROJECT_DIR/.env"
-        fi
-    else
-        log_info ".env files not loaded (--ignore-dot-env flag set)"
-    fi
-
-    # Build extra host entries from AGENTBOX_EXTRA_HOSTS
     local host_args=()
-    local extra_hosts=""
-    if [[ -f "$agentbox_env" ]]; then
-        extra_hosts=$(grep -E '^AGENTBOX_EXTRA_HOSTS=' "$agentbox_env" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'" || true)
-    fi
-    if [[ -n "$extra_hosts" ]]; then
-        IFS=',' read -ra host_entries <<< "$extra_hosts"
-        for entry in "${host_entries[@]}"; do
-            entry=$(echo "$entry" | xargs)  # trim whitespace
-            if [[ -n "$entry" ]]; then
-                host_args+=(--add-host "$entry")
-                log_info "Extra host: $entry"
-            fi
-        done
-    fi
+    build_extra_host_args host_args
 
-    # Build port forwarding arguments
     local port_args=()
-    for port in "${ports[@]}"; do
-        # Support both "3002" and "3002:8080" syntax
-        if [[ "$port" =~ ^[0-9]+$ ]]; then
-            # Simple port number - map to same port
-            port_args+=(-p "${port}:${port}")
-            log_info "Port forwarding: ${port} -> ${port}"
-        elif [[ "$port" =~ ^[0-9]+:[0-9]+$ ]]; then
-            # host:container syntax
-            port_args+=(-p "${port}")
-            log_info "Port forwarding: ${port}"
-        else
-            log_warning "Invalid port format: ${port} (use '3002' or '3002:8080')"
-        fi
-    done
+    build_port_args port_args ports_to_forward
 
-    # Build runtime-specific arguments
     local runtime_args=()
     if [[ "$RUNTIME" == "podman" ]]; then
         runtime_args+=(--userns=keep-id)
     fi
 
-    # Run ephemeral container with --rm
     $RUNTIME run -it --rm \
         --name "$container_name" \
         --hostname "agentbox-$PROJECT_NAME" \
@@ -515,7 +579,6 @@ ssh_setup() {
     log_info "Setting up AgentBox SSH directory..."
     mkdir -p "${agentbox_ssh}"
     chmod 700 "${agentbox_ssh}"
-
 
     # Copy known_hosts if it exists
     if [[ -f "${HOME}/.ssh/known_hosts" ]]; then
@@ -629,8 +692,8 @@ main() {
     RUNTIME=$(check_runtime)
     log_info "Using container runtime: $RUNTIME"
 
-    # Get container name for current project
-    local container_name=$(get_container_name)
+    local project_id=$(get_project_id)
+    local container_name=$(get_container_name "$project_id")
 
     # Validate dir paths (batch all errors so user sees all problems at once)
     local project_realpath
@@ -659,19 +722,9 @@ main() {
             log_error "Build failed!"
             exit 1
         fi
-
     fi
 
-    # Run or attach to container
-    if [[ "$shell_mode" == "true" ]]; then
-        if [[ "$admin_mode" == "true" ]]; then
-            run_container "$container_name" validated_dirs "$tool" "$ignore_dot_env" "shell" "--admin" "${cmd_args[@]}"
-        else
-            run_container "$container_name" validated_dirs "$tool" "$ignore_dot_env" "shell" "${cmd_args[@]}"
-        fi
-    else
-        run_container "$container_name" validated_dirs "$tool" "$ignore_dot_env" "${cmd_args[@]}"
-    fi
+    run_container "$container_name" "$project_id" validated_dirs "$tool" "$ignore_dot_env" "$shell_mode" "$admin_mode" ports "${cmd_args[@]}"
 }
 
 # Run main function

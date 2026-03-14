@@ -35,6 +35,12 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         libssl-dev libffi-dev \
         # Java dependencies
         default-jdk maven gradle \
+        # Go
+        golang \
+        # Lua
+        lua5.4 liblua5.4-dev luarocks \
+        # C/C++ linting and build
+        clang-format clang-tidy meson ninja-build \
         # Search tools
         ripgrep fd-find && \
     # Setup locale
@@ -78,6 +84,20 @@ RUN groupadd -g ${GROUP_ID} ${USERNAME} || true && \
 # Switch to user for language installations
 USER ${USERNAME}
 WORKDIR /home/${USERNAME}
+
+# Install Rust via rustup (includes cargo, rustfmt, clippy)
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable && \
+    echo 'source "$HOME/.cargo/env"' >> ~/.bashrc && \
+    echo 'source "$HOME/.cargo/env"' >> ~/.zshrc
+
+# Setup Go paths
+ENV GOPATH="/home/${USERNAME}/go"
+ENV PATH="${GOPATH}/bin:/usr/lib/go/bin:${PATH}"
+RUN mkdir -p "$GOPATH/bin" && \
+    echo 'export GOPATH="$HOME/go"' >> ~/.bashrc && \
+    echo 'export PATH="$GOPATH/bin:$PATH"' >> ~/.bashrc && \
+    echo 'export GOPATH="$HOME/go"' >> ~/.zshrc && \
+    echo 'export PATH="$GOPATH/bin:$PATH"' >> ~/.zshrc
 
 # Install uv for Python package management
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
@@ -126,7 +146,20 @@ RUN /home/${USERNAME}/.local/bin/uv tool install black && \
     /home/${USERNAME}/.local/bin/uv tool install pytest && \
     /home/${USERNAME}/.local/bin/uv tool install ipython && \
     /home/${USERNAME}/.local/bin/uv tool install poetry && \
-    /home/${USERNAME}/.local/bin/uv tool install pipenv
+    /home/${USERNAME}/.local/bin/uv tool install pipenv && \
+    /home/${USERNAME}/.local/bin/uv tool install flake8 && \
+    /home/${USERNAME}/.local/bin/uv tool install pylint && \
+    /home/${USERNAME}/.local/bin/uv tool install isort && \
+    /home/${USERNAME}/.local/bin/uv tool install pre-commit
+
+# Install golangci-lint
+RUN curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $HOME/.local/bin
+
+# Install Lua linters/formatters
+RUN luarocks install --local luacheck && \
+    . "$HOME/.cargo/env" && cargo install stylua && \
+    echo 'export PATH="$HOME/.luarocks/bin:$PATH"' >> ~/.bashrc && \
+    echo 'export PATH="$HOME/.luarocks/bin:$PATH"' >> ~/.zshrc
 
 # Install oh-my-zsh for better shell experience and setup NVM for zsh
 RUN sh -c "$(wget -O- https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended && \
@@ -201,11 +234,8 @@ USER ${USERNAME}
 # Dockerfile hasn't changed. This ensures fresh installs on explicit rebuilds instead
 # of relying on unpredictable auto-update timing.
 ARG BUILD_TIMESTAMP=unknown
-RUN curl -fsSL https://claude.ai/install.sh | bash -s stable && \
+RUN curl -fsSL https://claude.ai/install.sh | bash && \
     zsh -i -c 'which claude && claude --version'
-
-RUN curl -fsSL https://opencode.ai/install | bash && \
-    zsh -i -c 'which opencode && opencode --version'
 
 # Entrypoint
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
