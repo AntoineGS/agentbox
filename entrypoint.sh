@@ -47,8 +47,8 @@ if [ -f "/tmp/host_gitconfig" ]; then
 else
     cat > /home/agent/.gitconfig << 'EOF'
 [user]
-    email = agent@agentbox
-    name = AI Agent (AgentBox)
+    email = antoineg.simard@gmail.com
+    name = Antoine Gaudreau Simard
 [init]
     defaultBranch = main
 EOF
