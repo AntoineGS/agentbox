@@ -297,9 +297,10 @@ build_mount_opts() {
     local project_id="$2"
     local tool="$3"
     local -n dirs_ref=$4
+    local mount_dir="$5"
 
     mounts_ref=(
-        -v "$PROJECT_DIR:$PROJECT_DIR:z"
+        -v "$mount_dir:$mount_dir:z"
         --env "PROJECT_DIR=$PROJECT_DIR"
     )
 
@@ -307,6 +308,12 @@ build_mount_opts() {
 
     if [[ -f "${HOME}/.gitconfig" ]]; then
         mounts_ref+=(-v "${HOME}/.gitconfig:/tmp/host_gitconfig:ro")
+    fi
+
+    local gh_config="${HOME}/.config/gh"
+    if [[ -d "${gh_config}" ]]; then
+        mounts_ref+=(-v "${gh_config}:/home/agent/.config/gh:ro")
+        log_info "GitHub CLI auth mounted (read-only)"
     fi
 
     local agentbox_ssh="${HOME}/.agentbox/ssh"
@@ -481,7 +488,8 @@ run_container() {
     local shell_mode="$6"
     local admin_mode="$7"
     local -n ports_to_forward=$8
-    shift 8
+    local parent_mode="$9"
+    shift 9
     local cmd_args=("$@")
 
     if [[ "$admin_mode" == "true" ]]; then
@@ -490,8 +498,14 @@ run_container() {
         log_success "Starting container for: $PROJECT_NAME"
     fi
 
+    local mount_dir="$PROJECT_DIR"
+    if [[ "$parent_mode" == "true" ]]; then
+        mount_dir="$(dirname "$PROJECT_DIR")"
+        log_info "Parent mode: mounting $mount_dir (working directory: $PROJECT_DIR)"
+    fi
+
     local mount_opts=()
-    build_mount_opts mount_opts "$project_id" "$tool" extra_dirs_to_mount
+    build_mount_opts mount_opts "$project_id" "$tool" extra_dirs_to_mount "$mount_dir"
 
     local container_cmd=()
     build_container_cmd container_cmd "$shell_mode" "$admin_mode" "$tool" "${cmd_args[@]}"
@@ -537,6 +551,7 @@ Options:
     --tool TOOL             Choose tool: claude (default) or opencode
     -p PORT                 Forward a port from host to container (can be used multiple times)
     --rebuild               Force rebuild of the image
+    --parent                Mount parent directory instead of current directory (cwd unchanged)
     --add-dir DIR           Mount additional directory (can be used multiple times)
     --ignore-dot-env        Do not load .env files as environment variables (still mounted)
 
@@ -556,6 +571,7 @@ Examples:
     agentbox -p 3002:8080               # Map host port 3002 to container port 8080
     agentbox shell                      # Start interactive shell instead of Claude
     agentbox shell --admin              # Start admin shell with sudo access
+    agentbox --parent                      # Mount parent dir (access sibling repos)
     agentbox --add-dir ~/1 --add-dir ~/2  # Add dirs with Claude CLI
     agentbox python script.py           # Run Python script in container
     agentbox --rebuild                  # Force rebuild image
@@ -616,6 +632,7 @@ main() {
     local force_rebuild=false
     local shell_mode=false
     local admin_mode=false
+    local parent_mode=false
     local cmd_args=()
     declare -a ports=()
     local extra_dirs=()
@@ -657,6 +674,10 @@ main() {
                     exit 1
                 fi
                 tool="$1"
+                shift
+                ;;
+            --parent)
+                parent_mode=true
                 shift
                 ;;
             --ignore-dot-env)
@@ -701,7 +722,11 @@ main() {
 
     # Validate dir paths (batch all errors so user sees all problems at once)
     local project_realpath
-    project_realpath=$(realpath "$PROJECT_DIR")
+    if [[ "$parent_mode" == "true" ]]; then
+        project_realpath=$(realpath "$(dirname "$PROJECT_DIR")")
+    else
+        project_realpath=$(realpath "$PROJECT_DIR")
+    fi
     local validated_dirs=()
     local validation_failed=false
     for dir in "${extra_dirs[@]}"; do
@@ -728,7 +753,7 @@ main() {
         fi
     fi
 
-    run_container "$container_name" "$project_id" validated_dirs "$tool" "$ignore_dot_env" "$shell_mode" "$admin_mode" ports "${cmd_args[@]}"
+    run_container "$container_name" "$project_id" validated_dirs "$tool" "$ignore_dot_env" "$shell_mode" "$admin_mode" ports "$parent_mode" "${cmd_args[@]}"
 }
 
 # Run main function

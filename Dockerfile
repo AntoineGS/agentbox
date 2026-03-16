@@ -146,8 +146,9 @@ RUN /home/${USERNAME}/.local/bin/uv tool install black && \
     /home/${USERNAME}/.local/bin/uv tool install isort && \
     /home/${USERNAME}/.local/bin/uv tool install pre-commit
 
-# Install golangci-lint
-RUN curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $HOME/.local/bin
+# Install Go tools
+RUN curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $HOME/.local/bin && \
+    go install golang.org/x/vuln/cmd/govulncheck@latest
 
 # Install Lua linters/formatters
 RUN luarocks install --local luacheck && \
