@@ -40,7 +40,9 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         # C/C++ linting and build
         clang-format clang-tidy meson ninja-build \
         # Search tools
-        ripgrep fd-find && \
+        ripgrep fd-find \
+        # Clipboard tools (used by Claude CLI to read image pastes from host)
+        wl-clipboard xclip && \
     # Setup locale
     echo "en_US.UTF-8 UTF-8" > /etc/locale.gen && \
     locale-gen && \

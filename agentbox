@@ -281,6 +281,32 @@ mount_symlink_targets() {
     done
 }
 
+# Mount host clipboard sockets so Claude CLI can read image pastes.
+# Claude shells out to wl-paste/xclip, which need access to the host's
+# Wayland/X11 socket. Without this, image paste silently fails.
+mount_clipboard_sockets() {
+    local -n clipboard_mounts_ref=$1
+
+    if [[ -n "${WAYLAND_DISPLAY:-}" && -n "${XDG_RUNTIME_DIR:-}" ]]; then
+        local wayland_sock="${XDG_RUNTIME_DIR}/${WAYLAND_DISPLAY}"
+        if [[ -S "$wayland_sock" ]]; then
+            clipboard_mounts_ref+=(
+                -v "${wayland_sock}:/tmp/.agentbox-wayland"
+                --env "WAYLAND_DISPLAY=/tmp/.agentbox-wayland"
+            )
+            log_info "Wayland socket mounted (enables image paste)"
+        fi
+    fi
+
+    if [[ -n "${DISPLAY:-}" && -d /tmp/.X11-unix ]]; then
+        clipboard_mounts_ref+=(
+            -v "/tmp/.X11-unix:/tmp/.X11-unix:ro"
+            --env "DISPLAY=${DISPLAY}"
+        )
+        log_info "X11 socket mounted (enables image paste fallback)"
+    fi
+}
+
 # Mount additional dirs to Docker mount options
 mount_additional_dirs() {
     local -n mount_opts_ref=$1
@@ -329,6 +355,8 @@ build_mount_opts() {
     else
         log_warning "SSH not configured. Run 'agentbox ssh-init' to enable SSH operations."
     fi
+
+    mount_clipboard_sockets mounts_ref
 
     local cache_dir="${HOME}/.cache/agentbox/${project_id}"
     mkdir -p "${cache_dir}/npm" "${cache_dir}/pip" "${cache_dir}/maven" "${cache_dir}/gradle"
