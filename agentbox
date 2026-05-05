@@ -86,7 +86,7 @@ get_project_id() {
 
 get_container_name() {
     local project_id="$1"
-    local random_suffix=$(head -c4 /dev/urandom | xxd -p)
+    local random_suffix=$(printf '%04x%04x' $RANDOM $RANDOM)
     echo "${CONTAINER_PREFIX}-${project_id}-${random_suffix}"
 }
 
