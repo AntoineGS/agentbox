@@ -376,7 +376,7 @@ build_mount_opts() {
         --env "HISTFILE=/home/agent/.shell_history/zsh_history"
     )
 
-    if [[ "$tool" == "opencode" ]]; then
+    if [[ "$tool" == "opencode" || "$tool" == "ocv" ]]; then
         local opencode_config_dir="${HOME}/.config/opencode"
         local opencode_auth_dir="${HOME}/.local/share/opencode"
         mkdir -p "$opencode_config_dir" "$opencode_auth_dir"
@@ -385,7 +385,7 @@ build_mount_opts() {
             -v "${opencode_config_dir}:/home/agent/.config/opencode"
             -v "${opencode_auth_dir}:/home/agent/.local/share/opencode"
         )
-        log_info "OpenCode configuration and auth mounted"
+        log_info "OpenCode/ocv configuration and auth mounted"
     else
         local claude_dir="${HOME}/.claude"
         mkdir -p "$claude_dir"
@@ -434,6 +434,8 @@ build_container_cmd() {
     local tool_cmd
     if [[ "$tool" == "opencode" ]]; then
         tool_cmd="opencode"
+    elif [[ "$tool" == "ocv" ]]; then
+        tool_cmd="ocv"
     else
         tool_cmd="claude --dangerously-skip-permissions"
     fi
@@ -582,7 +584,7 @@ Usage:
 
 Options:
     -h, --help              Show this help message
-    --tool TOOL             Choose tool: claude (default) or opencode
+    --tool TOOL             Choose tool: claude (default), opencode, or ocv
     -p PORT                 Forward a port from host to container (can be used multiple times)
     --rebuild               Force rebuild of the image
     --parent                Mount parent directory instead of current directory (cwd unchanged)
@@ -601,6 +603,7 @@ Commands:
 Examples:
     agentbox                            # Start Claude CLI for current project
     agentbox --tool opencode            # Start OpenCode instead of Claude
+    agentbox --tool ocv                 # Start opencode-vim (ocv) instead of Claude
     agentbox -p 3002                    # Forward port 3002
     agentbox -p 3002:8080               # Map host port 3002 to container port 8080
     agentbox shell                      # Start interactive shell instead of Claude
@@ -742,8 +745,8 @@ main() {
     done
 
     # Validate tool selection
-    if [[ "$tool" != "claude" && "$tool" != "opencode" ]]; then
-        log_error "Invalid tool: $tool (must be 'claude' or 'opencode')"
+    if [[ "$tool" != "claude" && "$tool" != "opencode" && "$tool" != "ocv" ]]; then
+        log_error "Invalid tool: $tool (must be 'claude', 'opencode', or 'ocv')"
         exit 1
     fi
 
