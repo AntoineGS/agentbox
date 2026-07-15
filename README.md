@@ -187,7 +187,7 @@ Zsh history is preserved in `~/.agentbox/projects/<container-name>/history`
 
 ### Tool Authentication
 
-Both tools use bind mounts to share authentication across all AgentBox projects:
+The coding tools use bind mounts to share authentication across all AgentBox projects:
 
 **Claude CLI**:
 - `~/.claude` mounted at `/home/agent/.claude`
