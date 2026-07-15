@@ -237,6 +237,10 @@ ARG BUILD_TIMESTAMP=unknown
 RUN curl -fsSL https://claude.ai/install.sh | bash && \
     zsh -i -c 'which claude && claude --version'
 
+# Install opencode-vim (ocv), a keyboard-first opencode fork.
+RUN bash -c "source \"$NVM_DIR/nvm.sh\" && npm install -g @leohenon/ocv" && \
+    zsh -i -c 'which ocv && ocv --version'
+
 # Entrypoint
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["/bin/zsh"]
