@@ -149,7 +149,7 @@ RUN /home/${USERNAME}/.local/bin/uv tool install black && \
     /home/${USERNAME}/.local/bin/uv tool install pre-commit
 
 # Install Go tools
-RUN curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $HOME/.local/bin && \
+RUN curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/main/install.sh | sh -s -- -b $HOME/.local/bin && \
     go install golang.org/x/vuln/cmd/govulncheck@latest
 
 # Install Lua linters/formatters
