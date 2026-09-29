@@ -9,3 +9,4 @@ LICENSE
 .gitignore
 .dockerignore
 parallel-claude.sh
+tests

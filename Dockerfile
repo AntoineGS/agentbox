@@ -237,9 +237,12 @@ ARG BUILD_TIMESTAMP=unknown
 RUN curl -fsSL https://claude.ai/install.sh | bash && \
     zsh -i -c 'which claude && claude --version'
 
-# Install opencode-vim (ocv), a keyboard-first opencode fork.
-RUN bash -c "source \"$NVM_DIR/nvm.sh\" && npm install -g @leohenon/ocv" && \
-    zsh -i -c 'which ocv && ocv --version'
+# Install the official OpenCode V2 CLI and its JSONC parser dependency.
+ARG OPENCODE_VERSION=2
+RUN bash -c 'source "$NVM_DIR/nvm.sh" && \
+    npm install -g "@opencode/cli@${OPENCODE_VERSION}" && \
+    npm install --prefix "$HOME/.local/lib/agentbox" jsonc-parser@3.3.1 && \
+    opencode --version'
 
 # Entrypoint
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

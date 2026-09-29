@@ -21,6 +21,8 @@ readonly PROJECT_DIR="$(pwd)"
 readonly PROJECT_NAME="$(basename "$PROJECT_DIR")"
 readonly DOCKERFILE_PATH="${SCRIPT_DIR}/Dockerfile"
 readonly ENTRYPOINT_PATH="${SCRIPT_DIR}/entrypoint.sh"
+DEPENDENCIES_PATH="${SCRIPT_DIR}/opencode-dependencies.cjs"
+OPENCODE_VERSION=2
 readonly IMAGE_NAME="agentbox:latest"
 readonly CONTAINER_PREFIX="agentbox"
 
@@ -90,12 +92,45 @@ get_container_name() {
     echo "${CONTAINER_PREFIX}-${project_id}-${random_suffix}"
 }
 
+parse_opencode_version() {
+    local text="$1"
+    if [[ "$text" =~ (^|[[:space:]])v?([0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?)([[:space:]]|$) ]]; then
+        printf '%s\n' "${BASH_REMATCH[2]}"
+    else
+        return 1
+    fi
+}
+
+select_opencode_version() {
+    local tool="$1" output version
+    if ! command -v opencode >/dev/null 2>&1; then
+        printf '%s\n' 2
+        return
+    fi
+    if output=$(opencode --version 2>/dev/null) && version=$(parse_opencode_version "$output"); then
+        if [[ "$version" == 2.* ]]; then
+            printf '%s\n' "$version"
+            return
+        fi
+    fi
+    if [[ "$tool" == opencode ]]; then
+        log_error "Host OpenCode must report a V2 version before sharing its data."
+        return 1
+    fi
+    printf '%s\n' 2
+}
+
+calculate_image_hash() {
+    printf '%s\0' "$(calculate_hash "$DOCKERFILE_PATH")" \
+        "$(calculate_hash "$ENTRYPOINT_PATH")" \
+        "$(calculate_hash "$DEPENDENCIES_PATH")" "$OPENCODE_VERSION" |
+        sha256sum | cut -d' ' -f1
+}
+
 # Check if image needs rebuild
 needs_rebuild() {
-    # Calculate current Dockerfile and entrypoint hashes
-    local dockerfile_hash=$(calculate_hash "$DOCKERFILE_PATH")
-    local entrypoint_hash=$(calculate_hash "$ENTRYPOINT_PATH")
-    local combined_hash="${dockerfile_hash}-${entrypoint_hash}"
+    local combined_hash
+    combined_hash=$(calculate_image_hash)
 
     # Check if image exists
     if ! $RUNTIME image inspect "$IMAGE_NAME" &> /dev/null; then
@@ -128,9 +163,8 @@ needs_rebuild() {
 
 # Build Docker image
 build_image() {
-    local dockerfile_hash=$(calculate_hash "$DOCKERFILE_PATH")
-    local entrypoint_hash=$(calculate_hash "$ENTRYPOINT_PATH")
-    local combined_hash="${dockerfile_hash}-${entrypoint_hash}"
+    local combined_hash
+    combined_hash=$(calculate_image_hash)
 
     log_build "Building AgentBox image (this may take a few minutes on first run)..."
 
@@ -145,8 +179,10 @@ build_image() {
         --build-arg GROUP_ID="${group_id}" \
         --build-arg USERNAME="agent" \
         --build-arg BUILD_TIMESTAMP="${build_timestamp}" \
+        --build-arg "OPENCODE_VERSION=$OPENCODE_VERSION" \
         --label "agentbox.hash=${combined_hash}" \
         --label "agentbox.version=1.0.0" \
+        --label "agentbox.opencode_version=$OPENCODE_VERSION" \
         --label "agentbox.built=${build_timestamp}" \
         -t "$IMAGE_NAME" \
         "$SCRIPT_DIR" ; then
@@ -376,7 +412,7 @@ build_mount_opts() {
         --env "HISTFILE=/home/agent/.shell_history/zsh_history"
     )
 
-    if [[ "$tool" == "opencode" || "$tool" == "ocv" ]]; then
+    if [[ "$tool" == "opencode" ]]; then
         local opencode_config_dir="${HOME}/.config/opencode"
         local opencode_auth_dir="${HOME}/.local/share/opencode"
         mkdir -p "$opencode_config_dir" "$opencode_auth_dir"
@@ -385,7 +421,7 @@ build_mount_opts() {
             -v "${opencode_config_dir}:/home/agent/.config/opencode"
             -v "${opencode_auth_dir}:/home/agent/.local/share/opencode"
         )
-        log_info "OpenCode/ocv configuration and auth mounted"
+        log_info "OpenCode configuration and auth mounted"
     else
         local claude_dir="${HOME}/.claude"
         mkdir -p "$claude_dir"
@@ -434,8 +470,6 @@ build_container_cmd() {
     local tool_cmd
     if [[ "$tool" == "opencode" ]]; then
         tool_cmd="opencode"
-    elif [[ "$tool" == "ocv" ]]; then
-        tool_cmd="ocv"
     else
         tool_cmd="claude --dangerously-skip-permissions"
     fi
@@ -584,7 +618,7 @@ Usage:
 
 Options:
     -h, --help              Show this help message
-    --tool TOOL             Choose tool: claude (default), opencode, or ocv
+    --tool TOOL             Choose tool: claude (default) or opencode
     -p PORT                 Forward a port from host to container (can be used multiple times)
     --rebuild               Force rebuild of the image
     --parent                Mount parent directory instead of current directory (cwd unchanged)
@@ -603,7 +637,6 @@ Commands:
 Examples:
     agentbox                            # Start Claude CLI for current project
     agentbox --tool opencode            # Start OpenCode instead of Claude
-    agentbox --tool ocv                 # Start opencode-vim (ocv) instead of Claude
     agentbox -p 3002                    # Forward port 3002
     agentbox -p 3002:8080               # Map host port 3002 to container port 8080
     agentbox shell                      # Start interactive shell instead of Claude
@@ -707,7 +740,7 @@ main() {
             --tool)
                 shift
                 if [[ -z "${1:-}" ]]; then
-                    log_error "--tool requires a value (claude, opencode, or ocv)"
+                    log_error "--tool requires a value (claude or opencode)"
                     exit 1
                 fi
                 tool="$1"
@@ -745,10 +778,12 @@ main() {
     done
 
     # Validate tool selection
-    if [[ "$tool" != "claude" && "$tool" != "opencode" && "$tool" != "ocv" ]]; then
-        log_error "Invalid tool: $tool (must be 'claude', 'opencode', or 'ocv')"
+    if [[ "$tool" != "claude" && "$tool" != "opencode" ]]; then
+        log_error "Invalid tool: $tool (must be 'claude' or 'opencode')"
         exit 1
     fi
+
+    OPENCODE_VERSION=$(select_opencode_version "$tool") || exit 1
 
     # Check runtime
     RUNTIME=$(check_runtime)
@@ -793,5 +828,6 @@ main() {
     run_container "$container_name" "$project_id" validated_dirs "$tool" "$ignore_dot_env" "$shell_mode" "$admin_mode" ports "$parent_mode" "${cmd_args[@]}"
 }
 
-# Run main function
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
