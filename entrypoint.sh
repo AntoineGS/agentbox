@@ -15,6 +15,16 @@ if [ -s "$HOME/.nvm/nvm.sh" ]; then
     source "$NVM_DIR/nvm.sh"
 fi
 
+if [[ "${TOOL:-}" == opencode ]]; then
+    export OPENCODE_CONFIG_DIR="$HOME/.config/opencode"
+    export XDG_CONFIG_HOME="$HOME/.config"
+    export XDG_DATA_HOME="$HOME/.local/share"
+    export XDG_CACHE_HOME="$HOME/.cache"
+    export XDG_STATE_HOME="$HOME/.local/state"
+    unset OPENCODE_SESSION_ID
+    mkdir -p "$XDG_CACHE_HOME/opencode" "$XDG_STATE_HOME/opencode"
+fi
+
 if [ -f "$HOME/.sdkman/bin/sdkman-init.sh" ]; then
     source "$HOME/.sdkman/bin/sdkman-init.sh"
 fi

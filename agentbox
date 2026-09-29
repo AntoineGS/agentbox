@@ -28,6 +28,7 @@ readonly CONTAINER_PREFIX="agentbox"
 
 # Set by check_runtime() in main()
 RUNTIME=""
+OPENCODE_BASE_MOUNTS=()
 
 # Colors for output
 readonly RED='\033[0;31m'
@@ -413,15 +414,15 @@ build_mount_opts() {
     )
 
     if [[ "$tool" == "opencode" ]]; then
-        local opencode_config_dir="${HOME}/.config/opencode"
-        local opencode_auth_dir="${HOME}/.local/share/opencode"
-        mkdir -p "$opencode_config_dir" "$opencode_auth_dir"
-
-        mounts_ref+=(
-            -v "${opencode_config_dir}:/home/agent/.config/opencode"
-            -v "${opencode_auth_dir}:/home/agent/.local/share/opencode"
-        )
-        log_info "OpenCode configuration and auth mounted"
+        OPENCODE_BASE_MOUNTS=("$mount_dir" "$PROJECT_DIR" "${dirs_ref[@]}")
+        local -a opencode_mounts=()
+        build_opencode_mounts opencode_mounts "$project_id" || return 1
+        mounts_ref+=("${opencode_mounts[@]}")
+        local -a herdr_args=()
+        build_herdr_args herdr_args || return 1
+        mounts_ref+=("${herdr_args[@]}")
+        mounts_ref+=(--env "AGENTBOX_OPENCODE_VERSION=$OPENCODE_VERSION")
+        log_info "OpenCode configuration and auth mounted selectively"
     else
         local claude_dir="${HOME}/.claude"
         mkdir -p "$claude_dir"
@@ -469,7 +470,7 @@ build_container_cmd() {
 
     local tool_cmd
     if [[ "$tool" == "opencode" ]]; then
-        tool_cmd="opencode"
+        tool_cmd="opencode --standalone"
     else
         tool_cmd="claude --dangerously-skip-permissions"
     fi
@@ -482,6 +483,295 @@ build_container_cmd() {
         tool_cmd="$tool_cmd$escaped_args"
     fi
     cmd_ref=(zsh -c "source ~/.zshrc && exec $tool_cmd")
+}
+
+append_opencode_mount() {
+    local -n output_ref="$1" registry_ref="$5"
+    local source destination="$3" mode="$4"
+    if [[ "$mode" != ro && "$mode" != rw ]] ||
+        [[ "$2$destination" == *$'\n'* || "$2$destination" == *$'\r'* ||
+           "$2$destination" == *$'\t'* || "$2" == *:* || "$destination" == *:* ]] ||
+        [[ "$2" != /* || "$destination" != /* ]]; then
+        log_error "Unsupported OpenCode mount path or mode."
+        return 1
+    fi
+    source=$(realpath -e -- "$2") || {
+        log_error "Missing OpenCode dependency: $2"
+        return 1
+    }
+    if [[ "$source" == *:* || "$source" == *$'\n'* || "$source" == *$'\r'* || "$source" == *$'\t'* ]]; then
+        log_error "Unsupported resolved OpenCode mount path."
+        return 1
+    fi
+    local canonical_home
+    canonical_home=$(realpath -e -- "$HOME") || return 1
+    case "$source" in
+        /|/home|/usr|/usr/bin|/usr/sbin|/usr/lib|/usr/lib64|/usr/share|/etc|/var|"$HOME"|"$canonical_home")
+            log_error "Broad OpenCode mount is not allowed: $source"
+            return 1 ;;
+    esac
+    if is_critical_system_dir "$source" && [[ "$source" != /usr/lib/meridian && "$source" != /usr/lib/meridian/* ]]; then
+        log_error "Critical OpenCode mount is not allowed: $source"
+        return 1
+    fi
+    local signature="$source:$mode"
+    if [[ -n "${registry_ref[$destination]+present}" ]]; then
+        [[ "${registry_ref[$destination]}" == "$signature" ]] && return 0
+        log_error "Conflicting OpenCode mount: $destination"
+        return 1
+    fi
+    registry_ref["$destination"]="$signature"
+    output_ref+=(-v "$source:$destination:$mode")
+}
+
+validate_opencode_server_args() {
+    local argument skip_value=false
+    for argument in "$@"; do
+        if [[ "$skip_value" == true ]]; then skip_value=false; continue; fi
+        case "$argument" in
+            --) break ;;
+            --server|--server=*)
+                log_error "AgentBox OpenCode uses a private container server; --server is not supported."
+                return 1 ;;
+            --prompt|--session|-s|--model|-m|--agent|--format|--file|-f|--title|--data|-d|--header|-H|--param|--log-level|--completions)
+                skip_value=true ;;
+        esac
+    done
+}
+
+build_network_args() {
+    local -n network_ref="$1" publication_ref="$2" requested_ref="$4"
+    network_ref=()
+    # This output is populated indirectly by build_port_args for non-OpenCode tools.
+    # shellcheck disable=SC2034
+    publication_ref=()
+    if [[ "$3" == opencode ]]; then
+        network_ref+=(--network=host)
+        if (( ${#requested_ref[@]} )); then log_warning "OpenCode uses host networking; -p mappings are ignored."; fi
+    else
+        build_port_args "$2" "$4"
+    fi
+}
+
+build_herdr_args() {
+    local output_name="$1"
+    local -n mount_output="$output_name"
+    mount_output=()
+    [[ "${HERDR_ENV:-}" == 1 ]] || return 0
+    local advertised="${HERDR_SOCKET_PATH:-}"
+    if [[ -z "$advertised" || ! -S "$advertised" ]]; then
+        log_warning "Herdr socket is unavailable: ${advertised:-<unset>}"
+        return 0
+    fi
+    local resolved
+    resolved=$(realpath -e -- "$advertised") || { log_warning "Herdr socket is unavailable: $advertised"; return 0; }
+    [[ -S "$resolved" ]] || { log_warning "Herdr socket is unavailable: $advertised"; return 0; }
+    local -A registry=()
+    append_opencode_mount "$output_name" "$resolved" "$advertised" ro registry || return 1
+    local name
+    for name in HERDR_ENV HERDR_SOCKET_PATH HERDR_PANE_ID HERDR_TAB_ID HERDR_WORKSPACE_ID; do
+        if [[ -v $name ]]; then mount_output+=(--env "$name=${!name}"); fi
+    done
+}
+
+build_opencode_mounts() {
+    local output_name="$1"
+    # This nameref initializes the caller's array; subsequent additions use its name.
+    # shellcheck disable=SC2178
+    local -n mount_output="$output_name"
+    local project_id="$2"
+    mount_output=()
+    local cache_parent="$HOME/.cache/agentbox/$project_id"
+    local cache_dir="$cache_parent/opencode"
+    mkdir -p -- "$HOME/.config/opencode" "$HOME/.local/share/opencode" "$cache_dir" || return 1
+    # append_opencode_mount consumes this associative array by name.
+    # shellcheck disable=SC2034
+    local -A registry=()
+    local config="$HOME/.config/opencode" data="$HOME/.local/share/opencode"
+    local config_real data_real
+    config_real=$(realpath -e -- "$config") || return 1
+    data_real=$(realpath -e -- "$data") || return 1
+    append_opencode_mount "$output_name" "$config" "$config" rw registry || return 1
+    append_opencode_mount "$output_name" "$config_real" "$config_real" rw registry || return 1
+    append_opencode_mount "$output_name" "$config" /home/agent/.config/opencode rw registry || return 1
+    append_opencode_mount "$output_name" "$data" "$data" rw registry || return 1
+    append_opencode_mount "$output_name" "$data_real" "$data_real" rw registry || return 1
+    append_opencode_mount "$output_name" "$data" /home/agent/.local/share/opencode rw registry || return 1
+    append_opencode_mount "$output_name" "$cache_dir" /home/agent/.cache/opencode rw registry || return 1
+    for candidate in "$HOME/.claude/skills" "$HOME/.agents/skills"; do
+        if [[ -d "$candidate" ]]; then
+            local skills_real
+            skills_real=$(realpath -e -- "$candidate") || return 1
+            append_opencode_mount "$output_name" "$candidate" "$candidate" ro registry || return 1
+            append_opencode_mount "$output_name" "$skills_real" "$skills_real" ro registry || return 1
+            if [[ "$candidate" == "$HOME/.claude/skills" ]]; then destination=/home/agent/.claude/skills; else destination=/home/agent/.agents/skills; fi
+            append_opencode_mount "$output_name" "$candidate" "$destination" ro registry || return 1
+        fi
+    done
+    local -a probe_mounts=() scan_args=()
+    local -a config_symlink_targets=()
+    local -a project_config_files=()
+    local -A probe_registry=() all_records=()
+    local candidate source destination
+    for candidate in "$config" "$config_real"; do
+        append_opencode_mount probe_mounts "$candidate" "$candidate" ro probe_registry || return 1
+        scan_args+=(--scan "$candidate")
+    done
+    for candidate in "$HOME/.claude/skills" "$HOME/.agents/skills"; do
+        if [[ -d "$candidate" ]]; then
+            append_opencode_mount probe_mounts "$candidate" "$candidate" ro probe_registry || return 1
+            scan_args+=(--scan "$candidate")
+        fi
+    done
+    local ancestor config_file
+    ancestor="$PROJECT_DIR"
+    while :; do
+        candidate="$ancestor/.opencode"
+        if [[ -d "$candidate" ]]; then
+            append_opencode_mount probe_mounts "$candidate" "$candidate" ro probe_registry || return 1
+            scan_args+=(--scan "$candidate")
+        fi
+        for config_file in "$ancestor/opencode.json" "$ancestor/opencode.jsonc" "$ancestor/.opencode/opencode.json" "$ancestor/.opencode/opencode.jsonc"; do
+            if [[ -f "$config_file" || -L "$config_file" ]]; then
+                project_config_files+=("$config_file")
+                if [[ -L "$config_file" ]]; then
+                    local link_path="$config_file" link_target link_value
+                    while [[ -L "$link_path" ]]; do
+                        link_value=$(readlink -- "$link_path") || { log_error "Cannot inspect OpenCode dependency: $link_path"; return 1; }
+                        if [[ "$link_value" == /* ]]; then
+                            link_target=$(realpath -m -- "$link_value") || return 1
+                        else
+                            link_target=$(realpath -m -- "$(dirname -- "$link_path")/$link_value") || return 1
+                        fi
+                        if [[ "$link_target" == *:* || "$link_target" == *$'\t'* || "$link_target" == *$'\r'* || "$link_target" == *$'\n'* ]]; then
+                            log_error "Unsupported OpenCode mount path or mode."
+                            return 1
+                        fi
+                        config_symlink_targets+=("$link_target")
+                        if [[ -e "$link_target" ]]; then
+                            append_opencode_mount probe_mounts "$link_target" "$link_target" ro probe_registry || return 1
+                            scan_args+=(--scan "$link_target")
+                        else
+                            break
+                        fi
+                        link_path="$link_target"
+                    done
+                else
+                    append_opencode_mount probe_mounts "$config_file" "$config_file" ro probe_registry || return 1
+                fi
+            fi
+        done
+        [[ "$ancestor" == / ]] && break
+        ancestor=$(dirname -- "$ancestor")
+    done
+    for candidate in "${config_symlink_targets[@]}"; do
+        all_records["$candidate"]='ro:symlink:1'
+    done
+    for candidate in "${project_config_files[@]}"; do
+        all_records["$candidate"]='ro:root:1'
+    done
+    local probe_parent="$cache_parent" probe_dir manifest_file
+    mkdir -p -- "$probe_parent" || return 1
+    probe_dir=$(mktemp -d "$probe_parent/opencode-discovery.XXXXXX") || return 1
+    manifest_file="$probe_dir/manifest.tsv"
+    trap 'rm -rf -- "$probe_dir"' RETURN
+    local -a probe_runtime_args=()
+    [[ "$RUNTIME" == podman ]] && probe_runtime_args+=(--userns=keep-id)
+    local pass=0 changed=true record_mode record_role record_required dependency
+    while [[ "$changed" == true && $pass -lt 32 ]]; do
+        pass=$((pass + 1)); changed=false
+        # shellcheck disable=SC2016
+        if ! "$RUNTIME" run --rm --network=none --read-only --cap-drop=ALL --security-opt=no-new-privileges \
+            "${probe_runtime_args[@]}" "${probe_mounts[@]}" --entrypoint /bin/bash "$IMAGE_NAME" \
+            -c 'source "$NVM_DIR/nvm.sh"; exec node /usr/local/lib/agentbox/opencode-dependencies.cjs "$@"' \
+            agentbox-discovery --home "$HOME" --config "$HOME/.config/opencode" --project "$PROJECT_DIR" \
+            "${scan_args[@]}" >"$manifest_file"; then
+            log_error "OpenCode dependency probe failed."
+            return 1
+        fi
+        while IFS= read -r manifest_record; do
+            [[ -z "$manifest_record" ]] && continue
+            local manifest_without_tabs=${manifest_record//$'\t'/}
+            if (( ${#manifest_record} - ${#manifest_without_tabs} != 3 )); then
+                log_error "Invalid OpenCode dependency manifest record."
+                return 1
+            fi
+            IFS=$'\t' read -r record_mode record_role record_required dependency <<< "$manifest_record"
+            if [[ "$record_mode" != ro && "$record_mode" != rw ]] ||
+                [[ "$record_role" != root && "$record_role" != plugin && "$record_role" != skills && "$record_role" != file && "$record_role" != symlink ]] ||
+                [[ "$record_required" != 0 && "$record_required" != 1 ]] || [[ "$dependency" != /* ]] ||
+                [[ "$dependency" == *$'\n'* || "$dependency" == *$'\r'* || "$dependency" == *$'\t'* || "$dependency" == *:* ]]; then
+                log_error "Invalid OpenCode dependency manifest record."
+                return 1
+            fi
+            if [[ "$record_required" == 1 && ! -e "$dependency" ]]; then
+                log_error "Missing OpenCode dependency: $dependency"
+                return 1
+            fi
+            if [[ "$record_role" == plugin && -f "$dependency" && -f "$(dirname -- "$dependency")/package.json" ]]; then
+                dependency=$(dirname -- "$dependency")
+                record_role=plugin
+                record_mode=ro
+            fi
+            if [[ -n "${all_records[$dependency]+present}" ]]; then
+                local previous=${all_records[$dependency]}
+                local previous_mode=${previous%%:*} previous_role=${previous#*:}
+                previous_role=${previous_role%%:*}
+                local previous_required=${previous##*:} merged_mode="$record_mode" merged_role="$record_role" merged_required="$record_required"
+                if [[ "$previous_role" == file || "$record_role" == file ]]; then
+                    merged_mode=ro
+                    merged_role='file'
+                elif [[ "$previous_mode" == rw || "$record_mode" == rw ]]; then
+                    merged_mode=rw
+                fi
+                [[ "$previous_required" == 1 || "$record_required" == 1 ]] && merged_required=1
+                all_records["$dependency"]="$merged_mode:$merged_role:$merged_required"
+            else
+                all_records["$dependency"]="$record_mode:$record_role:$record_required"
+            fi
+            if [[ -e "$dependency" ]]; then
+                local lexical="$dependency"
+                local canonical
+                canonical=$(realpath -e -- "$dependency") || { log_error "Missing OpenCode dependency: $dependency"; return 1; }
+                for source in "$lexical" "$canonical"; do
+                    if [[ -z "${probe_registry[$source]+present}" ]]; then
+                        append_opencode_mount probe_mounts "$source" "$source" ro probe_registry || return 1
+                        scan_args+=(--scan "$source")
+                        changed=true
+                    fi
+                done
+            fi
+        done < "$manifest_file"
+    done
+    if [[ "$changed" == true ]]; then log_error "OpenCode dependency closure exceeded 32 passes."; return 1; fi
+    local -a ordered=()
+    for dependency in "${!all_records[@]}"; do ordered+=("$dependency"); done
+    while IFS= read -r dependency; do
+        [[ -z "$dependency" ]] && continue
+        local details=${all_records[$dependency]} mode=${all_records[$dependency]%%:*}
+        local role=${details#*:}; role=${role%%:*}
+        local required=${details##*:}
+        if [[ "$required" == 0 && ! -e "$dependency" ]]; then continue; fi
+        if [[ "$role" == file ]]; then mode=ro; fi
+        local covered=false mount_root
+        if [[ "$role" != file ]]; then
+            for mount_root in "${OPENCODE_BASE_MOUNTS[@]}"; do
+                if [[ -n "$mount_root" && ( "$dependency" == "$mount_root" || "$dependency" == "$mount_root"/* ) ]]; then covered=true; break; fi
+            done
+            if [[ "$covered" == true || "$dependency" == "$HOME/.config/opencode"* || "$dependency" == "$HOME/.local/share/opencode"* ]]; then continue; fi
+        fi
+        destination="$dependency"
+        append_opencode_mount "$output_name" "$dependency" "$destination" "$mode" registry || return 1
+        if [[ "$role" == root && -d "$dependency" ]]; then
+            local canonical_root
+            canonical_root=$(realpath -e -- "$dependency") || return 1
+            if [[ "$canonical_root" != "$dependency" ]]; then
+                append_opencode_mount "$output_name" "$dependency" "$canonical_root" "$mode" registry || return 1
+            fi
+        fi
+    done < <(printf '%s\n' "${ordered[@]}" | LC_ALL=C sort)
+    trap - RETURN
+    rm -rf -- "$probe_dir"
 }
 
 build_env_file_args() {
@@ -562,6 +852,10 @@ run_container() {
     shift 9
     local cmd_args=("$@")
 
+    if [[ "$tool" == opencode && "$shell_mode" != true ]]; then
+        validate_opencode_server_args "${cmd_args[@]}" || return 1
+    fi
+
     if [[ "$admin_mode" == "true" ]]; then
         log_success "Starting container for: $PROJECT_NAME (admin shell)"
     else
@@ -575,7 +869,7 @@ run_container() {
     fi
 
     local mount_opts=()
-    build_mount_opts mount_opts "$project_id" "$tool" extra_dirs_to_mount "$mount_dir"
+    build_mount_opts mount_opts "$project_id" "$tool" extra_dirs_to_mount "$mount_dir" || return 1
 
     local container_cmd=()
     build_container_cmd container_cmd "$shell_mode" "$admin_mode" "$tool" "${cmd_args[@]}"
@@ -586,8 +880,8 @@ run_container() {
     local host_args=()
     build_extra_host_args host_args
 
-    local port_args=()
-    build_port_args port_args ports_to_forward
+    local network_args=() port_args=()
+    build_network_args network_args port_args "$tool" ports_to_forward
 
     local runtime_args=()
     if [[ "$RUNTIME" == "podman" ]]; then
@@ -599,6 +893,7 @@ run_container() {
         --hostname "agentbox-$PROJECT_NAME" \
         "${runtime_args[@]}" \
         "${host_args[@]}" \
+        "${network_args[@]}" \
         "${port_args[@]}" \
         "${mount_opts[@]}" \
         "${env_file_args[@]}" \

@@ -18,15 +18,11 @@ function fixture(t) {
 }
 
 function bash(f, body, args = []) {
-  const library = path.join(f.home, 'agentbox-library.sh');
-  const source = fs.readFileSync(path.join(repo, 'agentbox'), 'utf8')
-    .replace(/\n# Run main function\nmain "\$@"\s*$/, '\n');
-  fs.writeFileSync(library, source);
   return spawnSync('bash', ['--noprofile', '--norc', '-c',
-    'set -euo pipefail; source "$AGENTBOX_TEST_SOURCE"; shift; ' + body,
+    'set -euo pipefail; source "$1/agentbox"; shift; ' + body,
     'agentbox-test', repo, ...args], {
     cwd: repo,
-    env: { ...process.env, HOME: f.home, PATH: `${f.bin}:${process.env.PATH}`, AGENTBOX_TEST_SOURCE: library },
+    env: { ...process.env, HOME: f.home, PATH: `${f.bin}:${process.env.PATH}` },
     encoding: 'utf8',
   });
 }
@@ -39,6 +35,236 @@ test('V2 output variants parse exactly', t => {
     assert.equal(result.stdout.trim(), '2.0.19');
   }
   assert.notEqual(bash(f, 'parse_opencode_version "$1"', ['not-a-version']).status, 0);
+});
+
+test('OpenCode uses host networking and omits port publication', t => {
+  const f = fixture(t);
+  const result = bash(f,
+    'declare -a net=() published=() requested=(3002 3002:8080); ' +
+    'build_network_args net published opencode requested; ' +
+    'printf "NET=%s\\n" "${net[*]}"; printf "PORTS=%s\\n" "${published[*]}"');
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /NET=--network=host/);
+  assert.match(result.stdout, /PORTS=\n/);
+  assert.match(result.stdout + result.stderr, /host networking/);
+});
+
+test('Claude retains ordinary networking and port mapping', t => {
+  const f = fixture(t);
+  const result = bash(f,
+    'declare -a net=() published=() requested=(3002); ' +
+    'build_network_args net published claude requested; ' +
+    'printf "NET=%s\\n" "${net[*]}"; printf "PORTS=%s\\n" "${published[*]}"');
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /NET=\n/);
+  assert.match(result.stdout, /PORTS=-p 3002:3002/);
+});
+
+test('private launch rejects server selection but not literal option values', t => {
+  const f = fixture(t);
+  for (const args of [['--server', 'http://127.0.0.1:4096'],
+    ['api', '--server=http://127.0.0.1:4096', 'get', '/api/info']]) {
+    assert.notEqual(bash(f, 'validate_opencode_server_args "$@"', args).status, 0);
+  }
+  assert.equal(bash(f, 'validate_opencode_server_args "$@"', ['--prompt', '--server']).status, 0);
+  assert.equal(bash(f, 'validate_opencode_server_args "$@"', ['run', '--', '--server']).status, 0);
+});
+
+test('credential mounts are individual read-only files', t => {
+  const f = fixture(t);
+  const file = path.join(f.home, "token with 'quote'");
+  fs.writeFileSync(file, 'fixture-only');
+  const result = bash(f,
+    'declare -a output=(); declare -A seen=(); ' +
+    'append_opencode_mount output "$1" "$1" ro seen; printf "%s\\n" "${output[@]}"', [file]);
+  assert.equal(result.status, 0, result.stderr);
+  assert.ok(result.stdout.includes(`${file}:${file}:ro`));
+  assert.ok(!result.stdout.includes(`${f.home}:${f.home}:`));
+});
+
+test('mount registry deduplicates equal mounts and rejects conflicting modes', t => {
+  const f = fixture(t);
+  const dir = path.join(f.home, 'specific'); fs.mkdirSync(dir);
+  const same = bash(f,
+    'declare -a output=(); declare -A seen=(); append_opencode_mount output "$1" /fixture ro seen; ' +
+    'append_opencode_mount output "$1" /fixture ro seen; printf "%s\\n" "${output[@]}"', [dir]);
+  assert.equal(same.status, 0, same.stderr);
+  assert.equal((same.stdout.match(/-v/g) || []).length, 1);
+  const conflict = bash(f,
+    'declare -a output=(); declare -A seen=(); append_opencode_mount output "$1" /fixture ro seen; ' +
+    'append_opencode_mount output "$1" /fixture rw seen', [dir]);
+  assert.notEqual(conflict.status, 0);
+});
+
+test('mount validation rejects broad roots and unsafe delimiters', t => {
+  const f = fixture(t);
+  const dir = path.join(f.home, 'specific'); fs.mkdirSync(dir);
+  for (const [source, destination] of [[f.home, f.home], [dir, '/fixture:bad'],
+    [dir, '/fixture\tbad'], [path.join(f.home, 'missing'), '/fixture']]) {
+    assert.notEqual(bash(f,
+      'declare -a output=(); declare -A seen=(); append_opencode_mount output "$1" "$2" ro seen',
+      [source, destination]).status, 0);
+  }
+});
+
+test('mount aliases resolve multi-hop symlinks without broadening to sibling repositories', t => {
+  const f = fixture(t);
+  const actual = path.join(f.home, 'config-target'); fs.mkdirSync(actual);
+  const link2 = path.join(f.home, 'config-link-two'); fs.symlinkSync(actual, link2);
+  const link1 = path.join(f.home, 'config-link-one'); fs.symlinkSync(link2, link1);
+  const result = bash(f,
+    'declare -a output=(); declare -A seen=(); ' +
+    'append_opencode_mount output "$1" "$1" ro seen; ' +
+    'append_opencode_mount output "$2" "$2" ro seen; printf "%s\\n" "${output[@]}"', [link1, actual]);
+  assert.equal(result.status, 0, result.stderr);
+  assert.ok(result.stdout.includes(`${actual}:${link1}:ro`));
+  assert.ok(!result.stdout.includes(`${path.dirname(f.home)}:`));
+});
+
+test('mount appender rejects a host home root without printing credential contents', t => {
+  const f = fixture(t); const secret = path.join(f.home, 'credential');
+  fs.writeFileSync(secret, 'TOP_SECRET_VALUE');
+  const result = bash(f,
+    'declare -a output=(); declare -A seen=(); append_opencode_mount output "$1" "$1" ro seen', [f.home]);
+  assert.notEqual(result.status, 0);
+  assert.doesNotMatch(result.stdout + result.stderr, /TOP_SECRET_VALUE/);
+});
+
+test('Herdr forwards only allowlisted context and mounts socket aliases alone', async t => {
+  const f = fixture(t);
+  const real = path.join(f.home, 'socket-dir'); const alias = path.join(f.home, 'socket-alias');
+  fs.mkdirSync(real); fs.symlinkSync(real, alias);
+  const actual = path.join(real, 'herdr.sock'); const advertised = path.join(alias, 'herdr.sock');
+  const server = require('node:net').createServer();
+  await new Promise(resolve => server.listen(actual, resolve));
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const result = bash(f,
+    'export HERDR_ENV=1 HERDR_SOCKET_PATH="$1" HERDR_PANE_ID=pane HERDR_TAB_ID=tab ' +
+    'HERDR_WORKSPACE_ID=workspace HERDR_SECRET=fixture-secret OPENCODE_SESSION_ID=host-session; ' +
+    'declare -a output=(); build_herdr_args output; printf "%s\\n" "${output[@]}"', [advertised]);
+  assert.equal(result.status, 0, result.stderr);
+  assert.ok(result.stdout.split('\n').includes(`${actual}:${advertised}:ro`), `${result.stdout}\n${result.stderr}`);
+  for (const id of ['HERDR_PANE_ID=pane', 'HERDR_TAB_ID=tab', 'HERDR_WORKSPACE_ID=workspace']) assert.match(result.stdout, new RegExp(id));
+  assert.doesNotMatch(result.stdout, /HERDR_SECRET|OPENCODE_SESSION_ID/);
+  assert.ok(!result.stdout.includes(`${real}:${real}:`));
+});
+
+test('missing Herdr socket warns without adding integration mounts and absent context is silent', t => {
+  const f = fixture(t); const missing = path.join(f.home, 'missing.sock');
+  const present = bash(f, 'unset HERDR_ENV; declare -a output=(); build_herdr_args output; printf "COUNT=%s\\n" "${#output[@]}"');
+  assert.equal(present.status, 0, present.stderr); assert.doesNotMatch(present.stderr, /socket/i);
+  const result = bash(f,
+    'export HERDR_ENV=1 HERDR_SOCKET_PATH="$1"; declare -a output=(); build_herdr_args output; printf "COUNT=%s\\n" "${#output[@]}"', [missing]);
+  assert.equal(result.status, 0, result.stderr); assert.match(result.stdout + result.stderr, /socket/i);
+  assert.match(result.stdout, /COUNT=0/);
+});
+
+test('probe closure is iterative, credentials are read-only, and cache is isolated', t => {
+  const f = fixture(t);
+  const dependencyRoot = path.join(f.home, 'plugin-root'); fs.mkdirSync(dependencyRoot);
+  const dependency = path.join(dependencyRoot, 'credential'); fs.writeFileSync(dependency, 'fixture');
+  const count = path.join(f.home, 'probe-count');
+  const probeArgv = path.join(f.home, 'probe-argv.bin');
+  fs.writeFileSync(path.join(f.bin, 'runtime'), `#!/bin/sh
+n=0; [ -f '${count}' ] && n=$(cat '${count}'); n=$((n+1)); printf '%s' "$n" > '${count}'
+printf '%s\\0' "$@" > '${probeArgv}'
+if [ "$n" -eq 1 ]; then
+  printf 'rw\\troot\\t1\\t%s\\n' '${dependencyRoot}'
+  printf 'ro\\tfile\\t1\\t%s\\n' '${dependency}'
+fi
+`, { mode: 0o755 });
+  const result = bash(f,
+    'declare -a output=(); RUNTIME=runtime; build_opencode_mounts output projectfixture; printf "%s\\n" "${output[@]}"');
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(fs.readFileSync(count, 'utf8'), '2');
+  assert.ok(result.stdout.includes(`${dependency}:${dependency}:ro`), `${result.stdout}\n${result.stderr}`);
+  assert.ok(result.stdout.includes(`${dependencyRoot}:${dependencyRoot}:rw`));
+  assert.ok(result.stdout.indexOf(`${dependencyRoot}:${dependencyRoot}:rw`) < result.stdout.indexOf(`${dependency}:${dependency}:ro`));
+  assert.ok(result.stdout.includes('/home/agent/.cache/opencode:rw'));
+  assert.doesNotMatch(result.stdout, /\.local\/state\/opencode/);
+  const probeArguments = fs.readFileSync(probeArgv).toString().split('\0').filter(Boolean);
+  for (const flag of ['--network=none', '--read-only', '--cap-drop=ALL', '--security-opt=no-new-privileges', '--entrypoint', '/bin/bash']) {
+    assert.ok(probeArguments.includes(flag), `probe should include ${flag}`);
+  }
+  assert.deepEqual(fs.readdirSync(path.join(f.home, '.cache/agentbox/projectfixture')), ['opencode']);
+});
+
+test('OpenCode config symlink roots are exposed at lexical, canonical, and container aliases', t => {
+  const f = fixture(t);
+  const canonical = path.join(f.home, 'config-repository'); fs.mkdirSync(canonical);
+  fs.mkdirSync(path.join(f.home, '.config'), { recursive: true });
+  fs.symlinkSync(canonical, path.join(f.home, '.config/opencode'));
+  fs.writeFileSync(path.join(f.bin, 'runtime'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  const result = bash(f,
+    'declare -a output=(); RUNTIME=runtime; build_opencode_mounts output aliasproject; printf "%s\\n" "${output[@]}"');
+  assert.equal(result.status, 0, result.stderr);
+  for (const mount of [
+    `${canonical}:${path.join(f.home, '.config/opencode')}:rw`,
+    `${canonical}:${canonical}:rw`,
+    `${canonical}:/home/agent/.config/opencode:rw`,
+  ]) assert.ok(result.stdout.includes(mount), `${result.stdout}\nmissing ${mount}`);
+});
+
+test('a malformed required dependency manifest prevents the main runtime launch', t => {
+  const f = fixture(t); const count = path.join(f.home, 'runtime-count');
+  for (const record of ['invalid\\trole\\t2\\t/path\\n',
+    `ro\\tfile\\t1\\t${path.join(f.home, 'missing-required')}\\n`]) {
+    fs.rmSync(count, { force: true });
+    fs.writeFileSync(path.join(f.bin, 'runtime'), `#!/bin/sh
+n=0; [ -f '${count}' ] && n=$(cat '${count}'); n=$((n+1)); printf '%s' "$n" > '${count}'
+printf '${record}'
+`, { mode: 0o755 });
+    const result = bash(f,
+      'RUNTIME=runtime; declare -a dirs=() ports=(); run_container name projectfixture dirs opencode false false false ports false');
+    assert.notEqual(result.status, 0);
+    assert.equal(fs.readFileSync(count, 'utf8'), '1');
+  }
+});
+
+test('managed OpenCode command pins standalone and quotes prompt data literally', t => {
+  const f = fixture(t);
+  const sentinel = path.join(f.home, 'prompt-injection');
+  const capture = path.join(f.home, 'argv.bin');
+  fs.writeFileSync(path.join(f.home, '.zshrc'), '');
+  fs.writeFileSync(path.join(f.bin, 'opencode'), `#!/bin/sh\nprintf '%s\\0' "$@" > '${capture}'\n`, { mode: 0o755 });
+  const prompt = `literal spaces 'quotes' $(touch ${sentinel}); semicolon`;
+  const result = bash(f,
+    'declare -a cmd=(); build_container_cmd cmd false false opencode --prompt "$1"; "${cmd[@]}"', [prompt]);
+  assert.equal(result.status, 0, result.stderr);
+  const argv = fs.readFileSync(capture).toString().split('\0').filter(Boolean);
+  assert.deepEqual(argv, ['--standalone', '--prompt', prompt]);
+  assert.equal(fs.existsSync(sentinel), false);
+});
+
+test('Claude managed command retains its permission option', t => {
+  const f = fixture(t);
+  const result = bash(f, 'declare -a cmd=(); build_container_cmd cmd false false claude; printf "%s\\n" "${cmd[@]}"');
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /claude --dangerously-skip-permissions/);
+});
+
+test('OpenCode runtime selectors override injected state paths only for OpenCode', t => {
+  const f = fixture(t);
+  const source = fs.readFileSync(path.join(repo, 'entrypoint.sh'), 'utf8');
+  const branch = source.match(/if \[\[ "\$\{TOOL:-\}" == opencode \]\]; then\n[\s\S]*?\nfi/);
+  assert.ok(branch, 'OpenCode runtime branch must exist');
+  const foreign = path.join(f.home, 'foreign-state'); fs.mkdirSync(foreign);
+  fs.writeFileSync(path.join(foreign, 'sentinel'), 'unchanged');
+  for (const tool of ['opencode', 'claude']) {
+    const result = spawnSync('bash', ['-c', branch[0] +
+      '\nprintf "%s|%s|%s|%s|%s|%s|%s\\n" "$OPENCODE_CONFIG_DIR" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_CACHE_HOME" "$XDG_STATE_HOME" "${OPENCODE_SESSION_ID:-}" "$ANTHROPIC_API_KEY"'], {
+      env: { ...process.env, HOME: f.home, TOOL: tool, OPENCODE_CONFIG_DIR: foreign,
+        XDG_CONFIG_HOME: foreign, XDG_DATA_HOME: foreign, XDG_CACHE_HOME: foreign,
+        XDG_STATE_HOME: foreign, OPENCODE_SESSION_ID: 'host-session', ANTHROPIC_API_KEY: 'preserved' },
+      encoding: 'utf8',
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const expected = tool === 'opencode'
+      ? [`${f.home}/.config/opencode`, `${f.home}/.config`, `${f.home}/.local/share`, `${f.home}/.cache`, `${f.home}/.local/state`, '', 'preserved']
+      : [foreign, foreign, foreign, foreign, foreign, 'host-session', 'preserved'];
+    assert.deepEqual(result.stdout.trim().split('|'), expected);
+  }
+  assert.equal(fs.readFileSync(path.join(foreign, 'sentinel'), 'utf8'), 'unchanged');
 });
 
 test('ocv is rejected before runtime access', t => {
