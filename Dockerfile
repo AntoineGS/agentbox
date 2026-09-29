@@ -224,6 +224,7 @@ USER root
 
 # Copy entrypoint script
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY opencode-dependencies.cjs /usr/local/lib/agentbox/opencode-dependencies.cjs
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
 # Set the user for runtime
