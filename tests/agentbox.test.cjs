@@ -9,22 +9,41 @@ function fixture(t) {
   fs.mkdirSync('/tmp/opencode', { recursive: true });
   const home = fs.mkdtempSync('/tmp/opencode/agentbox-test-');
   const bin = path.join(home, 'bin');
+  const projectDir = path.join(home, 'project');
   fs.mkdirSync(bin);
+  fs.mkdirSync(projectDir);
   for (const runtime of ['docker', 'podman']) {
     fs.writeFileSync(path.join(bin, runtime), '#!/bin/sh\nexit 1\n', { mode: 0o755 });
   }
   t.after(() => fs.rmSync(home, { recursive: true, force: true }));
-  return { home, bin };
+  return { home, bin, projectDir };
 }
 
 function bash(f, body, args = []) {
   return spawnSync('bash', ['--noprofile', '--norc', '-c',
     'set -euo pipefail; source "$1/agentbox"; shift; ' + body,
     'agentbox-test', repo, ...args], {
-    cwd: repo,
+    cwd: f.projectDir,
     env: { ...process.env, HOME: f.home, PATH: `${f.bin}:${process.env.PATH}` },
     encoding: 'utf8',
   });
+}
+
+function useRealDependencyHelper(f) {
+  const helper = path.join(repo, 'opencode-dependencies.cjs');
+  const runtime = `#!/usr/bin/env node
+const { spawnSync } = require('node:child_process');
+const helper = ${JSON.stringify(helper)};
+const marker = process.argv.indexOf('agentbox-discovery');
+if (marker < 0) process.exit(97);
+const result = spawnSync(process.execPath, [helper, ...process.argv.slice(marker + 1)], {
+  env: process.env, encoding: 'utf8',
+});
+if (result.stdout) process.stdout.write(result.stdout);
+if (result.stderr) process.stderr.write(result.stderr);
+process.exit(result.status ?? 1);
+`;
+  fs.writeFileSync(path.join(f.bin, 'runtime'), runtime, { mode: 0o755 });
 }
 
 test('V2 output variants parse exactly', t => {
@@ -203,6 +222,102 @@ test('OpenCode config symlink roots are exposed at lexical, canonical, and conta
     `${canonical}:${canonical}:rw`,
     `${canonical}:/home/agent/.config/opencode:rw`,
   ]) assert.ok(result.stdout.includes(mount), `${result.stdout}\nmissing ${mount}`);
+});
+
+test('real helper file records overlay every writable config/data alias', t => {
+  const f = fixture(t);
+  const configDir = path.join(f.home, 'config-store'); fs.mkdirSync(configDir);
+  fs.mkdirSync(path.join(f.home, '.config'), { recursive: true });
+  const configAlias = path.join(f.home, '.config/opencode'); fs.symlinkSync(configDir, configAlias);
+  const configCredential = path.join(configAlias, 'credential'); fs.writeFileSync(configCredential, 'CONFIG_SECRET_FIXTURE');
+  const dataDir = path.join(f.home, '.local/share/opencode'); fs.mkdirSync(dataDir, { recursive: true });
+  const dataCredential = path.join(dataDir, 'credential'); fs.writeFileSync(dataCredential, 'DATA_SECRET_FIXTURE');
+  fs.writeFileSync(path.join(configDir, 'opencode.jsonc'), JSON.stringify({
+    mcp: { first: { headers: { Authorization: `{file:${configCredential}}` } },
+      second: { headers: { Authorization: `{file:${dataCredential}}` } } },
+  }));
+  useRealDependencyHelper(f);
+  const result = bash(f,
+    'declare -a output=(); RUNTIME=runtime; build_opencode_mounts output files; printf "%s\\n" "${output[@]}"');
+  assert.equal(result.status, 0, result.stderr);
+  const mounts = result.stdout.split('\n');
+  const hasMount = (source, destination) => mounts.includes(`${source}:${destination}:ro`);
+  for (const destination of [
+    configCredential,
+    path.join(configDir, 'credential'),
+    '/home/agent/.config/opencode/credential',
+  ]) assert.ok(hasMount(path.join(configDir, 'credential'), destination), `${destination}\n${result.stdout}`);
+  for (const destination of [
+    dataCredential,
+    '/home/agent/.local/share/opencode/credential',
+  ]) assert.ok(hasMount(dataCredential, destination), `${destination}\n${result.stdout}`);
+  assert.doesNotMatch(result.stdout + result.stderr, /CONFIG_SECRET_FIXTURE|DATA_SECRET_FIXTURE/);
+});
+
+test('real helper mounts sibling-prefix dependencies and excludes unrelated siblings', t => {
+  const f = fixture(t);
+  const configExtra = path.join(f.home, '.config/opencode-extra');
+  const dataExtra = path.join(f.home, '.local/share/opencode-extra');
+  const unrelated = path.join(f.home, '.config/opencode-unrelated');
+  for (const dir of [configExtra, dataExtra, unrelated]) fs.mkdirSync(dir, { recursive: true });
+  fs.mkdirSync(path.join(f.home, '.config/opencode'), { recursive: true });
+  fs.writeFileSync(path.join(f.home, '.config/opencode/opencode.json'), JSON.stringify({
+    plugins: [configExtra, dataExtra],
+  }));
+  useRealDependencyHelper(f);
+  const result = bash(f,
+    'declare -a output=(); RUNTIME=runtime; build_opencode_mounts output siblings; printf "%s\\n" "${output[@]}"');
+  assert.equal(result.status, 0, result.stderr);
+  assert.ok(result.stdout.includes(`${configExtra}:${configExtra}:ro`));
+  assert.ok(result.stdout.includes(`${dataExtra}:${dataExtra}:ro`));
+  assert.ok(!result.stdout.includes(`${unrelated}:${unrelated}:`));
+});
+
+test('real helper closure mounts nested plugin package and multilevel external links only', t => {
+  const f = fixture(t);
+  const configDir = path.join(f.home, '.config/opencode'); fs.mkdirSync(configDir, { recursive: true });
+  const repoRoot = path.join(f.home, 'plugin-repositories');
+  const packageRoot = path.join(repoRoot, 'chosen-package');
+  const siblingRepo = path.join(repoRoot, 'unrelated-repository');
+  const pluginFile = path.join(packageRoot, 'dist/plugin.js');
+  fs.mkdirSync(path.dirname(pluginFile), { recursive: true });
+  fs.mkdirSync(siblingRepo, { recursive: true });
+  fs.writeFileSync(path.join(packageRoot, 'package.json'), '{"name":"chosen"}');
+  fs.writeFileSync(pluginFile, 'module fixture');
+  fs.mkdirSync(path.join(packageRoot, 'node_modules/chosen-dependency'), { recursive: true });
+  fs.writeFileSync(path.join(packageRoot, 'node_modules/chosen-dependency/index.js'), 'dependency fixture');
+  const externalParent = path.join(f.home, 'external-plugin-repositories');
+  const externalPlugin = path.join(externalParent, 'selected-plugin');
+  const externalSibling = path.join(externalParent, 'unrelated-sibling');
+  fs.mkdirSync(externalPlugin, { recursive: true }); fs.mkdirSync(externalSibling);
+  fs.writeFileSync(path.join(externalPlugin, 'plugin.js'), 'external fixture');
+  const middleLink = path.join(f.home, 'external-plugin-middle'); fs.symlinkSync(externalPlugin, middleLink);
+  const firstLink = path.join(configDir, 'plugins/external-entry');
+  fs.mkdirSync(path.dirname(firstLink), { recursive: true }); fs.symlinkSync(middleLink, firstLink);
+  fs.writeFileSync(path.join(configDir, 'opencode.json'), JSON.stringify({ plugins: [pluginFile, firstLink] }));
+  useRealDependencyHelper(f);
+  const result = bash(f,
+    'declare -a output=(); RUNTIME=runtime; build_opencode_mounts output closure; printf "%s\\n" "${output[@]}"');
+  assert.equal(result.status, 0, result.stderr);
+  assert.ok(result.stdout.includes(`${packageRoot}:${packageRoot}:ro`), result.stdout);
+  assert.ok(!result.stdout.includes(`${pluginFile}:${pluginFile}:ro`), result.stdout);
+  assert.ok(fs.readdirSync(path.join(packageRoot, 'node_modules')).includes('chosen-dependency'));
+  assert.ok(result.stdout.includes(`${externalPlugin}:${middleLink}:ro`));
+  assert.ok(result.stdout.includes(`${externalPlugin}:${externalPlugin}:ro`));
+  assert.ok(!result.stdout.includes(`${siblingRepo}:${siblingRepo}:`));
+  assert.ok(!result.stdout.includes(`${externalSibling}:${externalSibling}:`));
+});
+
+test('failed probe restores the caller RETURN trap and removes its private temp directory', t => {
+  const f = fixture(t); const parent = path.join(f.home, '.cache/agentbox/trapfixture');
+  fs.writeFileSync(path.join(f.bin, 'runtime'), '#!/bin/sh\nexit 42\n', { mode: 0o755 });
+  const result = bash(f,
+    'RUNTIME=runtime; trap \'printf CALLER_RETURN_TRAP >&2\' RETURN; ' +
+    'declare -a output=(); if build_opencode_mounts output trapfixture; then exit 91; fi; ' +
+    'trap -p RETURN; trap - RETURN');
+  assert.notEqual(result.status, 91);
+  assert.match(result.stdout + result.stderr, /CALLER_RETURN_TRAP/);
+  assert.deepEqual(fs.readdirSync(parent), ['opencode']);
 });
 
 test('a malformed required dependency manifest prevents the main runtime launch', t => {

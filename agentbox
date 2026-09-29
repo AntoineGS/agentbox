@@ -29,6 +29,8 @@ readonly CONTAINER_PREFIX="agentbox"
 # Set by check_runtime() in main()
 RUNTIME=""
 OPENCODE_BASE_MOUNTS=()
+OPENCODE_WRITABLE_SOURCES=()
+OPENCODE_WRITABLE_DESTINATIONS=()
 
 # Colors for output
 readonly RED='\033[0;31m'
@@ -524,6 +526,74 @@ append_opencode_mount() {
     output_ref+=(-v "$source:$destination:$mode")
 }
 
+is_path_within() {
+    local path="$1" root="$2"
+    if [[ "$root" == / ]]; then [[ "$path" == /* ]]; return; fi
+    root="${root%/}"
+    [[ "$path" == "$root" || "$path" == "$root/"* ]]
+}
+
+track_opencode_writable_root() {
+    local source="$1" destination="$2" canonical
+    canonical=$(realpath -e -- "$source") || return 1
+    OPENCODE_WRITABLE_SOURCES+=("$source" "$canonical")
+    OPENCODE_WRITABLE_DESTINATIONS+=("$destination" "$destination")
+}
+
+is_opencode_writable_path() {
+    local path="$1" root
+    for root in "${OPENCODE_WRITABLE_SOURCES[@]}" "${OPENCODE_WRITABLE_DESTINATIONS[@]}"; do
+        if is_path_within "$path" "$root"; then return 0; fi
+    done
+    return 1
+}
+
+find_opencode_package_root() {
+    # The nameref writes the detected package root to the caller's variable.
+    # shellcheck disable=SC2034
+    local -n root_ref="$1"
+    local file="$2" directory depth=0
+    root_ref=""
+    [[ -f "$file" ]] || return 0
+    directory=${file%/*}
+    [[ -n "$directory" ]] || directory=/
+    while (( depth < 16 )); do
+        if [[ -f "$directory/package.json" ]]; then
+            root_ref="$directory"
+            return 0
+        fi
+        [[ "$directory" == / ]] && return 0
+        directory=${directory%/*}
+        [[ -n "$directory" ]] || directory=/
+        depth=$((depth + 1))
+    done
+}
+
+mount_opencode_readonly_file_aliases() {
+    local output_name="$1" registry_name="$2" lexical_file="$3"
+    local canonical_file alias_source alias_destination relative candidate index
+    canonical_file=$(realpath -e -- "$lexical_file") || {
+        log_error "Missing OpenCode dependency: $lexical_file"
+        return 1
+    }
+    append_opencode_mount "$output_name" "$lexical_file" "$lexical_file" ro "$registry_name" || return 1
+    for ((index = 0; index < ${#OPENCODE_WRITABLE_SOURCES[@]}; index++)); do
+        alias_source=${OPENCODE_WRITABLE_SOURCES[index]}
+        alias_destination=${OPENCODE_WRITABLE_DESTINATIONS[index]}
+        for candidate in "$lexical_file" "$canonical_file"; do
+            if [[ "$candidate" == "$alias_source/"* ]]; then
+                relative=${candidate#"$alias_source"/}
+            elif [[ "$candidate" == "$alias_source" ]]; then
+                continue
+            else
+                continue
+            fi
+            append_opencode_mount "$output_name" "$canonical_file" \
+                "${alias_destination%/}/$relative" ro "$registry_name" || return 1
+        done
+    done
+}
+
 validate_opencode_server_args() {
     local argument skip_value=false
     for argument in "$@"; do
@@ -581,6 +651,8 @@ build_opencode_mounts() {
     local -n mount_output="$output_name"
     local project_id="$2"
     mount_output=()
+    OPENCODE_WRITABLE_SOURCES=()
+    OPENCODE_WRITABLE_DESTINATIONS=()
     local cache_parent="$HOME/.cache/agentbox/$project_id"
     local cache_dir="$cache_parent/opencode"
     mkdir -p -- "$HOME/.config/opencode" "$HOME/.local/share/opencode" "$cache_dir" || return 1
@@ -598,6 +670,16 @@ build_opencode_mounts() {
     append_opencode_mount "$output_name" "$data_real" "$data_real" rw registry || return 1
     append_opencode_mount "$output_name" "$data" /home/agent/.local/share/opencode rw registry || return 1
     append_opencode_mount "$output_name" "$cache_dir" /home/agent/.cache/opencode rw registry || return 1
+    track_opencode_writable_root "$config" "$config" || return 1
+    track_opencode_writable_root "$config_real" "$config_real" || return 1
+    track_opencode_writable_root "$config" /home/agent/.config/opencode || return 1
+    track_opencode_writable_root "$data" "$data" || return 1
+    track_opencode_writable_root "$data_real" "$data_real" || return 1
+    track_opencode_writable_root "$data" /home/agent/.local/share/opencode || return 1
+    track_opencode_writable_root "$cache_dir" /home/agent/.cache/opencode || return 1
+    for candidate in "${OPENCODE_BASE_MOUNTS[@]}"; do
+        track_opencode_writable_root "$candidate" "$candidate" || return 1
+    done
     for candidate in "$HOME/.claude/skills" "$HOME/.agents/skills"; do
         if [[ -d "$candidate" ]]; then
             local skills_real
@@ -674,7 +756,9 @@ build_opencode_mounts() {
     mkdir -p -- "$probe_parent" || return 1
     probe_dir=$(mktemp -d "$probe_parent/opencode-discovery.XXXXXX") || return 1
     manifest_file="$probe_dir/manifest.tsv"
-    trap 'rm -rf -- "$probe_dir"' RETURN
+    local previous_return_trap
+    previous_return_trap=$(trap -p RETURN)
+    trap 'rm -rf -- "$probe_dir"; if [[ -n "$previous_return_trap" ]]; then eval "$previous_return_trap"; else trap - RETURN; fi' RETURN
     local -a probe_runtime_args=()
     [[ "$RUNTIME" == podman ]] && probe_runtime_args+=(--userns=keep-id)
     local pass=0 changed=true record_mode record_role record_required dependency
@@ -708,8 +792,10 @@ build_opencode_mounts() {
                 log_error "Missing OpenCode dependency: $dependency"
                 return 1
             fi
-            if [[ "$record_role" == plugin && -f "$dependency" && -f "$(dirname -- "$dependency")/package.json" ]]; then
-                dependency=$(dirname -- "$dependency")
+            if [[ "$record_role" == plugin && -f "$dependency" ]]; then
+                local package_root
+                find_opencode_package_root package_root "$dependency" || return 1
+                if [[ -n "$package_root" ]]; then dependency="$package_root"; fi
                 record_role=plugin
                 record_mode=ro
             fi
@@ -752,14 +838,8 @@ build_opencode_mounts() {
         local role=${details#*:}; role=${role%%:*}
         local required=${details##*:}
         if [[ "$required" == 0 && ! -e "$dependency" ]]; then continue; fi
-        if [[ "$role" == file ]]; then mode=ro; fi
-        local covered=false mount_root
-        if [[ "$role" != file ]]; then
-            for mount_root in "${OPENCODE_BASE_MOUNTS[@]}"; do
-                if [[ -n "$mount_root" && ( "$dependency" == "$mount_root" || "$dependency" == "$mount_root"/* ) ]]; then covered=true; break; fi
-            done
-            if [[ "$covered" == true || "$dependency" == "$HOME/.config/opencode"* || "$dependency" == "$HOME/.local/share/opencode"* ]]; then continue; fi
-        fi
+        [[ "$role" == file ]] && continue
+        if is_opencode_writable_path "$dependency"; then continue; fi
         destination="$dependency"
         append_opencode_mount "$output_name" "$dependency" "$destination" "$mode" registry || return 1
         if [[ "$role" == root && -d "$dependency" ]]; then
@@ -767,10 +847,21 @@ build_opencode_mounts() {
             canonical_root=$(realpath -e -- "$dependency") || return 1
             if [[ "$canonical_root" != "$dependency" ]]; then
                 append_opencode_mount "$output_name" "$dependency" "$canonical_root" "$mode" registry || return 1
+                if [[ "$mode" == rw ]]; then track_opencode_writable_root "$dependency" "$canonical_root" || return 1; fi
             fi
+            if [[ "$mode" == rw ]]; then track_opencode_writable_root "$dependency" "$dependency" || return 1; fi
         fi
     done < <(printf '%s\n' "${ordered[@]}" | LC_ALL=C sort)
-    trap - RETURN
+    while IFS= read -r dependency; do
+        [[ -z "$dependency" ]] && continue
+        local details=${all_records[$dependency]} role=${all_records[$dependency]#*:}
+        role=${role%%:*}
+        [[ "$role" == file ]] || continue
+        local required=${details##*:}
+        if [[ "$required" == 0 && ! -e "$dependency" ]]; then continue; fi
+        mount_opencode_readonly_file_aliases "$output_name" registry "$dependency" || return 1
+    done < <(printf '%s\n' "${ordered[@]}" | LC_ALL=C sort)
+    if [[ -n "$previous_return_trap" ]]; then eval "$previous_return_trap"; else trap - RETURN; fi
     rm -rf -- "$probe_dir"
 }
 

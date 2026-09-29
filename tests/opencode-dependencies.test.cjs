@@ -234,15 +234,41 @@ test('malformed plugin and skill types identify source without values', t => {
 test('nested external symlinks are discovered without following a directory cycle', t => {
   const ctx = tree(t);
   const nested = path.join(ctx.configDir, 'plugins/nested');
-  const external = path.join(ctx.home, 'external-plugin');
+  const externalParent = path.join(ctx.home, 'external-repositories');
+  const external = path.join(externalParent, 'selected-plugin');
+  const sibling = path.join(externalParent, 'unrelated-repository');
   fs.mkdirSync(nested, { recursive: true });
-  fs.mkdirSync(external);
-  fs.symlinkSync(external, path.join(nested, 'dependency'));
+  fs.mkdirSync(external, { recursive: true });
+  fs.mkdirSync(sibling);
+  fs.symlinkSync(external, path.join(ctx.home, 'external-link-two'));
+  fs.symlinkSync(path.join(ctx.home, 'external-link-two'), path.join(nested, 'dependency'));
   fs.symlinkSync(ctx.configDir, path.join(nested, 'cycle'));
   const result = discover(ctx);
+  assert.ok(result.some(r => r.path === path.join(ctx.home, 'external-link-two') && r.role === 'symlink'));
   assert.ok(result.some(r => r.path === external && r.role === 'symlink'));
+  assert.ok(!result.some(r => r.path === sibling));
   assert.ok(!result.some(r => r.path === ctx.home));
   assert.ok(!result.some(r => r.path === ctx.configDir && r.role === 'symlink'));
+});
+
+test('nested plugin files and package symlinks are discovered without reading package contents', t => {
+  const ctx = tree(t);
+  const packageRoot = path.join(ctx.home, 'plugin-repository', 'selected-package');
+  const sibling = path.join(ctx.home, 'plugin-repository', 'unrelated-package');
+  const plugin = path.join(packageRoot, 'dist/plugin.js');
+  fs.mkdirSync(path.dirname(plugin), { recursive: true });
+  fs.mkdirSync(sibling, { recursive: true });
+  fs.writeFileSync(path.join(packageRoot, 'package.json'), '{"name":"fixture-only"}');
+  fs.writeFileSync(plugin, 'do not execute');
+  const linkedDependencies = path.join(ctx.home, 'external-node-modules');
+  fs.mkdirSync(linkedDependencies);
+  fs.symlinkSync(linkedDependencies, path.join(packageRoot, 'node_modules'));
+  fs.writeFileSync(source(ctx), JSON.stringify({ plugins: [plugin] }));
+  const result = discover({ ...ctx, scanRoots: [ctx.configDir, packageRoot] });
+  assert.ok(result.some(record => record.path === plugin && record.role === 'plugin'));
+  assert.ok(result.some(record => record.path === linkedDependencies && record.role === 'symlink'));
+  assert.ok(!result.some(record => record.path === sibling));
+  assert.doesNotMatch(JSON.stringify(result), /do not execute|fixture-only/);
 });
 
 test('CLI emits four path-only TSV fields and rejects malformed config safely', t => {
