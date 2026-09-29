@@ -69,6 +69,12 @@ test('package plugin declarations ignore npm, Git, and HTTP packages but accept 
     .some(record => record.path === file));
 });
 
+test('invalid file URLs fail without echoing configuration values', t => {
+  const ctx = tree(t);
+  assert.throws(() => collectConfig({ plugins: ['file://SENSITIVE_VALUE.invalid/path'] }, source(ctx), ctx), error =>
+    error.message.includes(source(ctx)) && !error.message.includes('SENSITIVE_VALUE'));
+});
+
 test('legacy skills.paths and global compatible skill roots are discovered', t => {
   const ctx = tree(t);
   const legacy = collectConfig({ skills: { paths: ['./skills'] } }, source(ctx), ctx);
@@ -89,6 +95,88 @@ test('ancestor project config and Meridian path declarations are collected as da
   const result = discover({ ...ctx, scanRoots: [ctx.configDir, meridian] });
   assert.ok(result.some(record => record.path === projectPlugin && record.role === 'plugin'));
   assert.ok(result.some(record => record.path === path.join(meridian, 'meridian-plugin') && record.role === 'plugin'));
+});
+
+test('project and ancestor config symlinks contribute their external target chains', t => {
+  const ctx = tree(t);
+  const external = path.join(ctx.home, 'external-configs');
+  fs.mkdirSync(external);
+  const settings = path.join(external, 'settings.json');
+  const settingsLink = path.join(external, 'settings-link.json');
+  fs.writeFileSync(settings, JSON.stringify({ plugins: ['./resolved-from-config'] }));
+  fs.symlinkSync(settings, settingsLink);
+  fs.symlinkSync(settingsLink, path.join(ctx.projectDir, 'opencode.json'));
+
+  const ancestorSettings = path.join(external, 'ancestor.json');
+  fs.writeFileSync(ancestorSettings, '{}');
+  fs.symlinkSync(ancestorSettings, path.join(ctx.home, 'opencode.json'));
+
+  const result = discover(ctx);
+  assert.ok(result.some(record => record.path === settingsLink && record.role === 'symlink'));
+  assert.ok(result.some(record => record.path === settings && record.role === 'symlink'));
+  assert.ok(result.some(record => record.path === ancestorSettings && record.role === 'symlink'));
+  assert.ok(result.some(record => record.path === path.join(ctx.projectDir, 'resolved-from-config')));
+});
+
+test('config symlink cycles and dangling targets terminate as path-only records', t => {
+  const ctx = tree(t);
+  const a = path.join(ctx.projectDir, 'opencode.json');
+  const b = path.join(ctx.home, 'config-b.json');
+  fs.symlinkSync(b, a);
+  fs.symlinkSync(a, b);
+  const dangling = path.join(ctx.projectDir, 'opencode.jsonc');
+  const absent = path.join(ctx.home, 'not-created.json');
+  fs.symlinkSync(absent, dangling);
+  const result = discover(ctx);
+  assert.ok(result.some(record => record.path === b && record.role === 'symlink'));
+  assert.ok(result.some(record => record.path === a && record.role === 'symlink'));
+  assert.ok(result.some(record => record.path === absent && record.role === 'symlink'));
+});
+
+test('file scan roots are terminal and file-link chains are inspected without reading contents', t => {
+  const ctx = tree(t);
+  const external = path.join(ctx.home, 'file-roots');
+  fs.mkdirSync(external);
+  const terminal = path.join(external, 'credential');
+  const middle = path.join(external, 'credential-link');
+  const start = path.join(ctx.projectDir, 'credential-link');
+  fs.writeFileSync(terminal, 'DO_NOT_READ_TOKEN');
+  fs.symlinkSync(terminal, middle);
+  fs.symlinkSync(middle, start);
+  const result = discover({ ...ctx, scanRoots: [ctx.configDir, terminal, start] });
+  assert.ok(result.some(record => record.path === middle && record.role === 'symlink'));
+  assert.ok(result.some(record => record.path === terminal && record.role === 'symlink'));
+  assert.doesNotMatch(JSON.stringify(result), /DO_NOT_READ_TOKEN/);
+});
+
+test('input and source delimiter paths fail safely before config reads', t => {
+  const ctx = tree(t);
+  const unsafeConfig = `${ctx.configDir}\nINJECTED`;
+  assert.throws(() => discover({ ...ctx, configDir: unsafeConfig }), error =>
+    error.message.startsWith('Unsupported dependency path: ') && !error.message.includes('\n'));
+  assert.throws(() => collectConfig({}, `${source(ctx)}\tINJECTED`, ctx), error =>
+    error.message.startsWith('Unsupported dependency path: ') && !error.message.includes('\t'));
+});
+
+test('malformed JSONC and metadata failures report fixed categories with sanitized paths', t => {
+  const ctx = tree(t);
+  const unsafeConfig = `${ctx.configDir}\nBAD`;
+  fs.mkdirSync(unsafeConfig);
+  fs.writeFileSync(path.join(unsafeConfig, 'opencode.json'), '{"secret":"PRIVATE", broken}');
+  assert.throws(() => discover({ ...ctx, configDir: unsafeConfig }), error =>
+    error.message.startsWith('Unsupported dependency path: ') && !error.message.includes('\n') && !error.message.includes('PRIVATE'));
+
+  const parentFile = path.join(ctx.home, 'not-a-directory');
+  fs.writeFileSync(parentFile, 'metadata fixture');
+  const invalidRoot = path.join(parentFile, 'child');
+  assert.throws(() => discover({ ...ctx, scanRoots: [ctx.configDir, invalidRoot] }), error =>
+    error.message.startsWith('Filesystem metadata failed: ') && error.message.includes(invalidRoot));
+  const cli = path.resolve(__dirname, '../opencode-dependencies.cjs');
+  const result = spawnSync(process.execPath, [cli, '--home', ctx.home, '--config', ctx.configDir,
+    '--project', ctx.projectDir, '--scan', invalidRoot], { encoding: 'utf8' });
+  assert.notEqual(result.status, 0);
+  assert.equal(result.stdout, '');
+  assert.ok(result.stderr.startsWith(`Filesystem metadata failed: ${invalidRoot}\n`));
 });
 
 test('a package directory that is itself a symlink is emitted without traversal', t => {
@@ -117,11 +205,12 @@ test('duplicate paths are normalized and deduplicated without widening credentia
   const ctx = tree(t);
   const credential = path.join(ctx.home, 'secret');
   fs.writeFileSync(source(ctx), JSON.stringify({ plugins: ['./plugin', path.join(ctx.configDir, 'plugin')],
-    mcp: { one: `{file:${credential}}` } }));
+    mcp: { one: `{file:${credential}}`, collision: `{file:${ctx.configDir}}` } }));
   const result = discover(ctx);
   const plugins = result.filter(record => record.path === path.join(ctx.configDir, 'plugin'));
   assert.equal(plugins.length, 1);
   assert.deepEqual(result.find(record => record.path === credential), { path: credential, mode: 'ro', role: 'file', required: true });
+  assert.deepEqual(result.find(record => record.path === ctx.configDir), { path: ctx.configDir, mode: 'ro', role: 'file', required: true });
 });
 
 test('rejects tab, newline, NUL, and colon dependency paths', t => {
@@ -153,6 +242,7 @@ test('nested external symlinks are discovered without following a directory cycl
   const result = discover(ctx);
   assert.ok(result.some(r => r.path === external && r.role === 'symlink'));
   assert.ok(!result.some(r => r.path === ctx.home));
+  assert.ok(!result.some(r => r.path === ctx.configDir && r.role === 'symlink'));
 });
 
 test('CLI emits four path-only TSV fields and rejects malformed config safely', t => {
