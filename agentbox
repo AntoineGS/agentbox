@@ -472,7 +472,13 @@ build_container_cmd() {
 
     local tool_cmd
     if [[ "$tool" == "opencode" ]]; then
-        tool_cmd="opencode --standalone"
+        case "${args[0]:-}" in
+            api|run)
+                tool_cmd="opencode ${args[0]} --standalone"
+                args=("${args[@]:1}")
+                ;;
+            *) tool_cmd="opencode --standalone" ;;
+        esac
     else
         tool_cmd="claude --dangerously-skip-permissions"
     fi
@@ -484,7 +490,11 @@ build_container_cmd() {
         done
         tool_cmd="$tool_cmd$escaped_args"
     fi
-    cmd_ref=(zsh -c "source ~/.zshrc && exec $tool_cmd")
+    if [[ "$tool" == "opencode" ]]; then
+        cmd_ref=(zsh -c "source ~/.zshrc || true; exec $tool_cmd")
+    else
+        cmd_ref=(zsh -c "source ~/.zshrc && exec $tool_cmd")
+    fi
 }
 
 append_opencode_mount() {
@@ -831,6 +841,10 @@ build_opencode_mounts() {
     done
     if [[ "$changed" == true ]]; then log_error "OpenCode dependency closure exceeded 32 passes."; return 1; fi
     local -a ordered=()
+    local meridian_config="$HOME/.config/meridian" meridian_config_real=
+    if [[ -d "$meridian_config" ]]; then
+        meridian_config_real=$(realpath -e -- "$meridian_config") || return 1
+    fi
     for dependency in "${!all_records[@]}"; do ordered+=("$dependency"); done
     while IFS= read -r dependency; do
         [[ -z "$dependency" ]] && continue
@@ -850,6 +864,14 @@ build_opencode_mounts() {
                 if [[ "$mode" == rw ]]; then track_opencode_writable_root "$dependency" "$canonical_root" || return 1; fi
             fi
             if [[ "$mode" == rw ]]; then track_opencode_writable_root "$dependency" "$dependency" || return 1; fi
+            if [[ "$dependency" == "$meridian_config" ||
+                ( -n "$meridian_config_real" && "$dependency" == "$meridian_config_real" ) ]]; then
+                append_opencode_mount "$output_name" "$dependency" \
+                    /home/agent/.config/meridian "$mode" registry || return 1
+                if [[ "$mode" == rw ]]; then
+                    track_opencode_writable_root "$dependency" /home/agent/.config/meridian || return 1
+                fi
+            fi
         fi
     done < <(printf '%s\n' "${ordered[@]}" | LC_ALL=C sort)
     while IFS= read -r dependency; do

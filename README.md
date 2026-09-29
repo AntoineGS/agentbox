@@ -37,7 +37,7 @@ No configuration needed - just install either runtime.
 ## CLI Agent Support
 
 - claude code: built-in
-- opencode: built-in
+- OpenCode V2: built-in; uses the host V2 version when installed.
 - any other agents (copilot CLI, Aider, Cursor CLI...): easily add it yourself using the prompt at [docs/prompts/add-tool.md](docs/prompts/add-tool.md).
 
 ### Adding tools
@@ -188,8 +188,16 @@ The coding tools use bind mounts to share authentication across all AgentBox pro
 - `~/.claude` mounted at `/home/agent/.claude`
 
 **OpenCode**:
-- Config: `~/.config/opencode` mounted at `/home/agent/.config/opencode`
-- Auth: `~/.local/share/opencode` mounted at `/home/agent/.local/share/opencode`
+OpenCode shares host configuration, authentication, and session history.
+Local plugins, skills, symlink targets, and referenced credential files are
+mounted selectively; external credentials and installed plugin code are read-only.
+Container cache persists separately, and OpenCode uses a private container server.
+
+OpenCode uses host networking for local services such as Meridian. This removes
+network isolation; `-p` mappings are ignored. Herdr context and its socket are
+forwarded when available. Claude networking and launch behavior are unchanged.
+
+The `--server` option conflicts with AgentBox-managed private-server execution.
 
 ## Advanced Usage
 
@@ -208,11 +216,11 @@ agentbox --rebuild
 ```
 
 The image automatically rebuilds when:
-- Dockerfile or entrypoint.sh changes
+- Dockerfile, entrypoint.sh, the OpenCode dependency helper, or selected OpenCode version changes
 - Image is older than 48 hours (to get latest tool versions)
 
 ## Tool / Dependency Versions
-The Dockerfile is configured to pull the latest stable version of each tool (NVM, GitLab CLI, etc.) during the build process. This makes maintenance easy and ensures that we always use current software. It also means that rebuilding the container image may automatically result in newer versions of tools being installed, which could introduce unexpected behavior or breaking changes. If you require specific tool versions, consider pinning them in the Dockerfile.
+The Dockerfile refreshes general tools during rebuilds. OpenCode V2 follows the host's selected V2 version when installed, so its shared data stays version-compatible.
 
 ## Alternatives
 ### Anthropic DevContainer

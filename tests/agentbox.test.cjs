@@ -1,8 +1,9 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
+const http = require('node:http');
 const path = require('node:path');
-const { spawnSync } = require('node:child_process');
+const { spawn, spawnSync } = require('node:child_process');
 const repo = path.resolve(__dirname, '..');
 
 function fixture(t) {
@@ -44,6 +45,67 @@ if (result.stderr) process.stderr.write(result.stderr);
 process.exit(result.status ?? 1);
 `;
   fs.writeFileSync(path.join(f.bin, 'runtime'), runtime, { mode: 0o755 });
+}
+
+function smokeEnvironment(f, record, overrides = {}) {
+  const env = { ...process.env, HOME: f.home, PATH: `${f.bin}:${process.env.PATH}`,
+    TOOL: 'opencode', AGENTBOX_OPENCODE_VERSION: '2', RECORD: record,
+    OPENCODE_CONFIG_DIR: `${f.home}/.config/opencode`,
+    XDG_STATE_HOME: `${f.home}/.local/state` };
+  delete env.OPENCODE_PASSWORD;
+  delete env.OPENCODE_SERVER_PASSWORD;
+  return { ...env, ...overrides };
+}
+
+function writeSmokeOpenCode(f, { version = '2.0.19', plugins, mcps, failEndpoint } = {}) {
+  const record = path.join(f.home, 'smoke-calls.jsonl');
+  const pluginCatalog = plugins ?? { data: [{ id: 'fixture-plugin',
+    source: { path: '/fixture/plugins/source-plugin', target: '/fixture/plugins/source-plugin' },
+    state: { status: 'active' }, description: 'CATALOG_CONTENT_FIXTURE' }] };
+  const mcpCatalog = mcps ?? { data: [
+    { name: 'connected-fixture', status: { status: 'connected' } },
+    { name: 'disabled-fixture', status: { status: 'disabled', error: 'MCP_ERROR_FIXTURE' } },
+  ] };
+  const program = `#!/usr/bin/env node
+const fs = require('node:fs');
+const args = process.argv.slice(2);
+fs.appendFileSync(process.env.RECORD, JSON.stringify({ args,
+  passwordPresent: Boolean(process.env.OPENCODE_PASSWORD),
+  legacyPasswordPresent: Object.hasOwn(process.env, 'OPENCODE_SERVER_PASSWORD') }) + '\\n');
+if (args[0] === '--version') { process.stdout.write('opencode v${version}\\n'); process.exit(0); }
+if (args[0] === 'serve') {
+  process.stdout.write('server listening on http://127.0.0.1:49123\\n');
+  process.on('SIGTERM', () => process.exit(0));
+  setInterval(() => {}, 1000);
+} else if (args[0] === 'api') {
+  const endpoint = args[args.length - 1];
+  if (endpoint === ${JSON.stringify(failEndpoint ?? '')}) {
+    process.stderr.write('PRIVATE_API_ERROR_FIXTURE\\n'); process.exit(17);
+  }
+  const catalogs = { '/api/plugin': ${JSON.stringify(pluginCatalog)}, '/api/mcp': ${JSON.stringify(mcpCatalog)} };
+  const response = catalogs[endpoint] ?? { data: [] };
+  process.stdout.write(JSON.stringify(response));
+} else { process.exit(99); }
+`;
+  fs.writeFileSync(path.join(f.bin, 'opencode'), program, { mode: 0o755 });
+  return record;
+}
+
+function runSmokeAsync(f, args, env) {
+  return new Promise((resolve, reject) => {
+    const child = spawn('bash', [path.join(repo, 'tests/opencode-smoke.sh'), ...args], {
+      cwd: f.projectDir, env, stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = ''; let stderr = '';
+    child.stdout.setEncoding('utf8').on('data', chunk => { stdout += chunk; });
+    child.stderr.setEncoding('utf8').on('data', chunk => { stderr += chunk; });
+    child.once('error', reject);
+    child.once('close', status => resolve({ status, stdout, stderr }));
+  });
+}
+
+function smokeCalls(record) {
+  return fs.readFileSync(record, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
 }
 
 test('V2 output variants parse exactly', t => {
@@ -224,6 +286,19 @@ test('OpenCode config symlink roots are exposed at lexical, canonical, and conta
   ]) assert.ok(result.stdout.includes(mount), `${result.stdout}\nmissing ${mount}`);
 });
 
+test('Meridian configuration dependency is mounted at its container-home alias', t => {
+  const f = fixture(t);
+  const meridianConfig = path.join(f.home, '.config/meridian');
+  fs.mkdirSync(meridianConfig, { recursive: true });
+  fs.writeFileSync(path.join(f.bin, 'runtime'),
+    `#!/bin/sh\nprintf 'rw\\troot\\t1\\t%s\\n' '${meridianConfig}'\n`, { mode: 0o755 });
+  const result = bash(f,
+    'declare -a output=(); RUNTIME=runtime; build_opencode_mounts output meridianfixture; printf "%s\\n" "${output[@]}"');
+  assert.equal(result.status, 0, result.stderr);
+  assert.ok(result.stdout.includes(`${meridianConfig}:${meridianConfig}:rw`), result.stdout);
+  assert.ok(result.stdout.includes(`${meridianConfig}:/home/agent/.config/meridian:rw`), result.stdout);
+});
+
 test('real helper file records overlay every writable config/data alias', t => {
   const f = fixture(t);
   const configDir = path.join(f.home, 'config-store'); fs.mkdirSync(configDir);
@@ -349,6 +424,45 @@ test('managed OpenCode command pins standalone and quotes prompt data literally'
   const argv = fs.readFileSync(capture).toString().split('\0').filter(Boolean);
   assert.deepEqual(argv, ['--standalone', '--prompt', prompt]);
   assert.equal(fs.existsSync(sentinel), false);
+});
+
+test('managed API and run commands receive standalone after their subcommand', t => {
+  const f = fixture(t);
+  const capture = path.join(f.home, 'argv.bin');
+  fs.writeFileSync(path.join(f.home, '.zshrc'), '');
+  fs.writeFileSync(path.join(f.bin, 'opencode'), `#!/bin/sh\nprintf '%s\\0' "$@" > '${capture}'\n`, { mode: 0o755 });
+  for (const [args, expected] of [
+    [['api', 'get', '/api/info'], ['api', '--standalone', 'get', '/api/info']],
+    [['run', 'fixture request'], ['run', '--standalone', 'fixture request']],
+  ]) {
+    const result = bash(f,
+      'declare -a cmd=(); build_container_cmd cmd false false opencode "$@"; "${cmd[@]}"', args);
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(fs.readFileSync(capture).toString().split('\0').filter(Boolean), expected);
+  }
+});
+
+test('OpenCode managed commands continue after a nonzero zsh rc while Claude keeps its existing gate', t => {
+  const f = fixture(t);
+  const capture = path.join(f.home, 'opencode-argv.bin');
+  const claudeCapture = path.join(f.home, 'claude-called');
+  fs.writeFileSync(path.join(f.home, '.zshrc'), 'return 1\n');
+  fs.writeFileSync(path.join(f.bin, 'zsh'), '#!/bin/sh\nexec bash -c "$2"\n', { mode: 0o755 });
+  fs.writeFileSync(path.join(f.bin, 'opencode'),
+    `#!/bin/sh\nprintf '%s\\0' "$@" > '${capture}'\n`, { mode: 0o755 });
+  fs.writeFileSync(path.join(f.bin, 'claude'),
+    `#!/bin/sh\nprintf called > '${claudeCapture}'\n`, { mode: 0o755 });
+
+  const openCode = bash(f,
+    'declare -a cmd=(); build_container_cmd cmd false false opencode api get /api/info; "${cmd[@]}"');
+  assert.equal(openCode.status, 0, openCode.stderr);
+  assert.deepEqual(fs.readFileSync(capture).toString().split('\0').filter(Boolean),
+    ['api', '--standalone', 'get', '/api/info']);
+
+  const claude = bash(f,
+    'declare -a cmd=(); build_container_cmd cmd false false claude; "${cmd[@]}"');
+  assert.notEqual(claude.status, 0);
+  assert.equal(fs.existsSync(claudeCapture), false);
 });
 
 test('Claude managed command retains its permission option', t => {
@@ -502,4 +616,160 @@ test('production files no longer install or launch ocv', () => {
   assert.match(dockerfile, /@opencode\/cli/);
   assert.doesNotMatch(dockerfile, /@leohenon\/ocv/);
   assert.doesNotMatch(fs.readFileSync(path.join(repo, 'entrypoint.sh'), 'utf8'), /\bocv\b/);
+});
+
+test('smoke rejects a version mismatch before starting its private server', t => {
+  const f = fixture(t);
+  const record = path.join(f.home, 'calls');
+  const smoke = path.join(repo, 'tests/opencode-smoke.sh');
+  assert.ok(fs.existsSync(smoke), 'OpenCode smoke checker must exist');
+  fs.writeFileSync(path.join(f.bin, 'opencode'),
+    '#!/bin/sh\nprintf "%s\\n" "$*" >> "$RECORD"\nprintf "%s\\n" "2.0.18"\n',
+    { mode: 0o755 });
+  const result = spawnSync('bash', [smoke], {
+    env: { ...process.env, HOME: f.home, PATH: `${f.bin}:${process.env.PATH}`,
+      TOOL: 'opencode', AGENTBOX_OPENCODE_VERSION: '2.0.19', RECORD: record,
+      OPENCODE_CONFIG_DIR: `${f.home}/.config/opencode`,
+      XDG_STATE_HOME: `${f.home}/.local/state` },
+    encoding: 'utf8',
+  });
+  assert.notEqual(result.status, 0);
+  assert.equal(fs.readFileSync(record, 'utf8').trim(), '--version');
+});
+
+test('smoke rejects a non-OpenCode tool and a missing version selector before CLI calls', t => {
+  const f = fixture(t);
+  const record = path.join(f.home, 'calls');
+  fs.writeFileSync(path.join(f.bin, 'opencode'),
+    '#!/bin/sh\nprintf "%s\\n" "$*" >> "$RECORD"\n', { mode: 0o755 });
+  const smoke = path.join(repo, 'tests/opencode-smoke.sh');
+  const wrongTool = spawnSync('bash', [smoke], {
+    env: smokeEnvironment(f, record, { TOOL: 'claude' }), encoding: 'utf8',
+  });
+  assert.notEqual(wrongTool.status, 0);
+  assert.equal(fs.existsSync(record), false);
+  const missingSelectorEnv = smokeEnvironment(f, record);
+  delete missingSelectorEnv.AGENTBOX_OPENCODE_VERSION;
+  const missingSelector = spawnSync('bash', [smoke], {
+    env: missingSelectorEnv, encoding: 'utf8',
+  });
+  assert.notEqual(missingSelector.status, 0);
+  assert.equal(fs.existsSync(record), false);
+});
+
+test('smoke validates declared options without echoing their values or calling OpenCode', t => {
+  const f = fixture(t);
+  const record = path.join(f.home, 'calls');
+  fs.writeFileSync(path.join(f.bin, 'opencode'), '#!/bin/sh\nprintf called >> "$RECORD"\n', { mode: 0o755 });
+  const smoke = path.join(repo, 'tests/opencode-smoke.sh');
+  for (const args of [['--unknown-option', 'OPTION_VALUE_FIXTURE'], ['--disabled-mcp']]) {
+    const result = spawnSync('bash', [smoke, ...args], {
+      env: smokeEnvironment(f, record), encoding: 'utf8',
+    });
+    assert.notEqual(result.status, 0);
+    assert.doesNotMatch(result.stdout + result.stderr, /OPTION_VALUE_FIXTURE/);
+    assert.equal(fs.existsSync(record), false);
+  }
+});
+
+test('smoke checks all read-only APIs and requested plugin, MCP, Meridian, and private-password contracts', async t => {
+  const f = fixture(t);
+  const record = writeSmokeOpenCode(f, { plugins: { data: [
+    { id: 'fixture-plugin', source: { path: '/fixture/plugins/source-plugin' }, state: { status: 'active' } },
+  ] } });
+  const timeoutRecord = path.join(f.home, 'timeout-values');
+  fs.writeFileSync(path.join(f.bin, 'timeout'),
+    '#!/bin/sh\nprintf "%s\\n" "$1" >> "$TIMEOUT_RECORD"\nshift\nexec "$@"\n',
+    { mode: 0o755 });
+  const meridianRequests = [];
+  const meridian = http.createServer((request, response) => {
+    meridianRequests.push(request.url);
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({ data: [{ id: 'fixture-model' }] }));
+  });
+  await new Promise(resolve => meridian.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise(resolve => meridian.close(resolve)));
+  const address = meridian.address();
+  const result = await runSmokeAsync(f, [
+    '--require-plugin', 'fixture-plugin',
+    '--require-plugin', '/fixture/plugins/source-plugin',
+    '--require-mcp', 'connected-fixture',
+    '--disabled-mcp', 'disabled-fixture',
+    '--meridian-url', `http://127.0.0.1:${address.port}/v1/models`,
+  ], smokeEnvironment(f, record, {
+    OPENCODE_PASSWORD: 'OLD_PASSWORD_FIXTURE',
+    OPENCODE_SERVER_PASSWORD: 'LEGACY_PASSWORD_FIXTURE',
+    TIMEOUT_RECORD: timeoutRecord,
+  }));
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  for (const endpoint of ['info', 'plugin', 'agent', 'skill', 'command', 'model', 'mcp']) {
+    assert.match(result.stdout, new RegExp(`Verified API endpoint: ${endpoint}`));
+  }
+  assert.match(result.stdout, /Verified API endpoint: plugin \(1 entries\)/);
+  assert.match(result.stdout, /Verified plugin: fixture-plugin \(active\)/);
+  assert.match(result.stdout, /Verified MCP: connected-fixture \(connected\)/);
+  assert.match(result.stdout, /Verified disabled MCP: disabled-fixture/);
+  assert.deepEqual(meridianRequests, ['/v1/models']);
+  assert.doesNotMatch(result.stdout + result.stderr,
+    /CATALOG_CONTENT_FIXTURE|MCP_ERROR_FIXTURE|OLD_PASSWORD_FIXTURE|LEGACY_PASSWORD_FIXTURE/);
+  const calls = smokeCalls(record);
+  assert.equal(calls.filter(call => call.args[0] === 'serve').length, 1);
+  assert.equal(calls.filter(call => call.args[0] === 'api').length, 7);
+  assert.ok(fs.readFileSync(timeoutRecord, 'utf8').trim().split('\n')
+    .every(value => Number.parseInt(value, 10) >= 60), 'API timeout should honor the 120-second deadline');
+  assert.deepEqual(calls.filter(call => call.args[0] === 'api').map(call => call.args.at(-1)).sort(),
+    ['/api/agent', '/api/command', '/api/info', '/api/mcp', '/api/model', '/api/plugin', '/api/skill']);
+  assert.ok(calls.filter(call => call.args[0] === 'api').every(call =>
+    call.args.includes('--server') && call.args.includes('http://127.0.0.1:49123') && call.args.includes('get')));
+  const serveCall = calls.find(call => call.args[0] === 'serve');
+  assert.equal(serveCall.passwordPresent, true);
+  assert.equal(serveCall.legacyPasswordPresent, false);
+});
+
+test('smoke reports API failure without echoing service stderr or response data', async t => {
+  const f = fixture(t);
+  const record = writeSmokeOpenCode(f, { failEndpoint: '/api/info' });
+  const result = await runSmokeAsync(f, [], smokeEnvironment(f, record));
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /API request failed: \/api\/info \(exit status: 17\)/);
+  assert.doesNotMatch(result.stdout + result.stderr, /PRIVATE_API_ERROR_FIXTURE/);
+});
+
+test('smoke reports only requested plugin status when a readiness refresh times out', async t => {
+  const f = fixture(t);
+  const record = writeSmokeOpenCode(f);
+  const countFile = path.join(f.home, 'plugin-refresh-count');
+  fs.writeFileSync(path.join(f.bin, 'timeout'), `#!/bin/sh
+shift
+case "$*" in
+  *"/api/plugin")
+    count=0; [ ! -f '${countFile}' ] || count=$(cat '${countFile}')
+    count=$((count + 1)); printf '%s' "$count" > '${countFile}'
+    [ "$count" -le 1 ] || exit 124
+    ;;
+esac
+exec "$@"
+`, { mode: 0o755 });
+  const result = await runSmokeAsync(f, ['--require-plugin', 'absent-plugin'],
+    smokeEnvironment(f, record));
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /Required plugin is not active: absent-plugin \(status: missing\)/);
+  assert.doesNotMatch(result.stdout + result.stderr, /CATALOG_CONTENT_FIXTURE|PRIVATE_API_ERROR_FIXTURE/);
+});
+
+test('OpenCode documentation records its sharing boundary, host networking, and rebuild contract', () => {
+  const readme = fs.readFileSync(path.join(repo, 'README.md'), 'utf8');
+  const notes = fs.readFileSync(path.join(repo, 'DEVELOPMENT_NOTES.md'), 'utf8');
+  for (const phrase of [
+    'OpenCode V2: built-in; uses the host V2 version when installed.',
+    'OpenCode shares host configuration, authentication, and session history.',
+    'mounted selectively', 'Container cache persists separately', 'private container server',
+    'host networking', '`-p` mappings are ignored',
+    'The `--server` option conflicts with AgentBox-managed private-server execution.',
+  ]) assert.ok(readme.includes(phrase), `README is missing: ${phrase}`);
+  assert.ok(/OpenCode dependency helper.*selected OpenCode version changes/.test(readme),
+    'README must include helper and version rebuilds');
+  for (const phrase of ['OpenCode V2', 'dependency helper', 'runtime/service state remains container-local', 'Herdr']) {
+    assert.ok(notes.includes(phrase), `Development notes are missing: ${phrase}`);
+  }
 });

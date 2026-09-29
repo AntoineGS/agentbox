@@ -17,7 +17,7 @@ AgentBox is a simplified replacement for ClaudeBox. The user was maintaining pat
 
 2. **Hash-Based Naming**: Container names use SHA256 hash of project directory path (first 12 chars) to ensure uniqueness and avoid conflicts.
 
-3. **Bind Over Volume**: Claude CLI and OpenCode use bind mounts to host directories.
+3. **Bind Over Volume**: Claude CLI and OpenCode use bind mounts to host directories. OpenCode mounts configured dependencies selectively; it does not mount the host home directory.
 
 4. **SSH Implementation**: Currently mounts `~/.agentbox/ssh/` directory directly (not true SSH agent forwarding). Future improvement could use Docker's `--ssh` flag for better security.
 
@@ -26,14 +26,15 @@ AgentBox is a simplified replacement for ClaudeBox. The user was maintaining pat
 ## Implementation Details
 
 ### File Responsibilities
-- `Dockerfile`: Multi-stage build with all language toolchains. Uses `USER agent` (UID 1000)
-- `entrypoint.sh`: Minimal - only sets PATH and creates Python venvs
-- `agentbox`: Main logic - rebuild detection, container lifecycle, mount management
+- `Dockerfile`: Multi-stage build with language toolchains and the official `@opencode/cli` V2 package. Uses `USER agent` (UID 1000)
+- `entrypoint.sh`: Sets PATH and Python venvs; selects shared OpenCode config/data and container-local cache/state paths
+- `agentbox`: Main logic - V2 version selection, rebuild detection, selective mounts, host networking, and private-server launch
+- `opencode-dependencies.cjs`: Read-only JSON/JSONC discovery of configured plugins, skills, and referenced files; emits mount records without credential values
 
 ### Rebuild Detection
 Automatic rebuilds are triggered by:
-1. **File changes**: SHA256 hash of Dockerfile + entrypoint.sh stored as Docker image label. Compares on each run.
-2. **Time-based**: If image is older than 48 hours, rebuild automatically to get latest tool versions (Claude Code/OpenCode).
+1. **Compatibility changes**: Dockerfile, entrypoint.sh, dependency helper, or selected host OpenCode V2 version changes the stored image hash.
+2. **Time-based**: If image is older than 48 hours, rebuild automatically to refresh tools.
 
 This ensures tools stay updated without manual intervention or version checking overhead.
 
@@ -85,8 +86,11 @@ $PROJECT_DIR            # Project directory (mounted at full host path)
 /home/agent/.gradle     # Gradle cache
 /home/agent/.shell_history  # History directory (HISTFILE env var points to zsh_history inside)
 /home/agent/.claude     # Claude config
-/home/agent/.config/opencode  # OpenCode config
-/home/agent/.local/share/opencode  # OpenCode auth
+/home/agent/.config/opencode  # Shared OpenCode config and local definitions (selective aliases)
+/home/agent/.local/share/opencode  # Shared OpenCode auth and session history
+/home/agent/.cache/opencode  # AgentBox-persisted OpenCode cache
+# OpenCode runtime/service state remains container-local under ~/.local/state
+# Plugin/skill roots and referenced credential files are mounted selectively, read-only
 ```
 
 ## Testing Status
@@ -94,6 +98,14 @@ $PROJECT_DIR            # Project directory (mounted at full host path)
 - Full Docker build/run cycle needs real environment testing
 - Multi-project isolation designed but not stress-tested
 - SSH operations need testing with actual Git repositories
+
+The opt-in read-only OpenCode smoke runs inside an OpenCode-selected shell:
+`agentbox --tool opencode shell bash tests/opencode-smoke.sh [OPTIONS]`.
+It checks V2 catalogs and can require plugin IDs/sources or MCP statuses with
+`--require-plugin`, `--require-mcp`, `--disabled-mcp`, and `--meridian-url`.
+It starts and cleans up only its own container-local private server; it sends
+no prompts or session-control requests. When Herdr is active, it opens the
+forwarded socket without sending RPC data or changing a pane/session.
 
 ## Potential Future Improvements
 
