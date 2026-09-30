@@ -64,7 +64,8 @@ function smokeEnvironment(f, record, overrides = {}) {
 }
 
 function writeSmokeOpenCode(f, { version = '2.0.19', plugins, agents, skills, commands,
-  mcps, delayedCatalogs = {}, catalogLocation, requirePrivatePassword = false,
+  mcps, delayedCatalogs = {}, delayedLocationActivationMs = 0, catalogLocation,
+  requirePrivatePassword = false,
   apiErrorEndpoint, failEndpoint } = {}) {
   const record = path.join(f.home, 'smoke-calls.jsonl');
   const pluginCatalog = plugins ?? { data: [{ id: 'fixture-plugin',
@@ -87,11 +88,14 @@ fs.appendFileSync(process.env.RECORD, JSON.stringify({ args, pid: process.pid,
 if (args[0] === '--version') { process.stdout.write('opencode v${version}\\n'); process.exit(0); }
 if (args[0] === 'serve') {
   const startedAt = Date.now();
+  let firstPluginRequestAt;
   const catalogs = { '/api/plugin': ${JSON.stringify(pluginCatalog)}, '/api/agent': ${JSON.stringify(agentCatalog)},
     '/api/skill': ${JSON.stringify(skillCatalog)}, '/api/command': ${JSON.stringify(commandCatalog)},
     '/api/mcp': ${JSON.stringify(mcpCatalog)} };
   const server = http.createServer((request, response) => {
     const endpoint = request.url;
+    const requestAt = Date.now();
+    if (endpoint === '/api/plugin' && firstPluginRequestAt === undefined) firstPluginRequestAt = requestAt;
     const authenticated = request.headers.authorization === 'Basic ' +
       Buffer.from('opencode:' + (process.env.OPENCODE_PASSWORD ?? '')).toString('base64');
     fs.appendFileSync(process.env.RECORD, JSON.stringify({ args: ['http', request.method, endpoint],
@@ -105,8 +109,13 @@ if (args[0] === 'serve') {
     let body = catalogs[endpoint] ?? { data: [] };
     const delayMs = (${JSON.stringify(delayedCatalogs)})[endpoint] ?? 0;
     if (Date.now() - startedAt < delayMs) body = { data: [] };
+    if (${delayedLocationActivationMs} && firstPluginRequestAt !== undefined &&
+        Date.now() - firstPluginRequestAt < ${delayedLocationActivationMs}) body = { data: [] };
     if (endpoint !== '/api/info') body = { location: { directory: ${JSON.stringify(catalogLocation ?? null)} ?? process.cwd() }, ...body };
     if (endpoint === ${JSON.stringify(apiErrorEndpoint ?? '')}) body = { error: { name: 'Forbidden', message: 'SENSITIVE_API_ERROR_FIXTURE' } };
+    fs.appendFileSync(process.env.RECORD, JSON.stringify({ args: ['response', endpoint], at: requestAt,
+      elapsedSinceLocationWarmup: firstPluginRequestAt === undefined ? null : requestAt - firstPluginRequestAt,
+      returnedEntries: Array.isArray(body.data) ? body.data.length : null }) + '\\n');
     response.writeHead(200, { 'content-type': 'application/json' }); response.end(JSON.stringify(body));
   });
   server.listen(0, '127.0.0.1', () => process.stdout.write('server listening on http://127.0.0.1:' + server.address().port + '\\n'));
@@ -132,6 +141,19 @@ function runSmokeAsync(f, args, env) {
 
 function smokeCalls(record) {
   return fs.readFileSync(record, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
+}
+
+async function waitForSmokeCall(record, predicate, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (fs.existsSync(record)) {
+      try {
+        const calls = smokeCalls(record);
+        if (calls.some(predicate)) return calls;
+      } catch { /* Wait for a complete recorder line. */ }
+    }
+    await new Promise(resolve => setTimeout(resolve, 25));
+  }
 }
 
 test('V2 output variants parse exactly', t => {
@@ -745,8 +767,10 @@ test('smoke checks all read-only APIs and requested plugin, MCP, Meridian, and p
     .every(value => Number.parseInt(value, 10) >= 60), 'API timeout should honor the 120-second deadline');
   const refreshCount = apiCalls.filter(call => call.args.at(-1) === '/api/plugin').length;
   assert.ok(refreshCount >= 2, 'catalogs should be refreshed after bounded startup readiness');
-  for (const endpoint of ['/api/agent', '/api/command', '/api/mcp', '/api/model', '/api/plugin', '/api/skill']) {
-    assert.equal(apiCalls.filter(call => call.args.at(-1) === endpoint).length, refreshCount,
+  assert.equal(apiCalls.filter(call => call.args.at(-1) === '/api/plugin').length, refreshCount,
+    'plugin requests include the location warm-up');
+  for (const endpoint of ['/api/agent', '/api/command', '/api/mcp', '/api/model', '/api/skill']) {
+    assert.equal(apiCalls.filter(call => call.args.at(-1) === endpoint).length, refreshCount - 1,
       `${endpoint} must be refreshed together with the final snapshot`);
   }
   assert.equal(apiCalls.filter(call => call.args.at(-1) === '/api/info').length, 1);
@@ -796,6 +820,30 @@ test('smoke waits for delayed configured catalogs and reports refreshed counts',
     'command catalog must be refreshed after delayed startup');
 });
 
+test('default smoke warms the location before waiting and makes no catalog readiness claims', async t => {
+  const f = fixture(t);
+  const record = writeSmokeOpenCode(f, {
+    plugins: { data: [{ id: 'delayed-location-plugin', state: { status: 'active' } }] },
+    agents: { data: [{ id: 'delayed-location-agent', name: 'Delayed location agent' }] },
+    delayedLocationActivationMs: 1000,
+  });
+  const result = await runSmokeAsync(f, [], smokeEnvironment(f, record));
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  assert.match(result.stdout, /Catalog readiness and entry counts were not assessed/);
+  assert.match(result.stdout, /plugin \(response shape and location valid; entries not assessed\)/);
+  assert.doesNotMatch(result.stdout, /\(\d+ entries\)/);
+  const calls = smokeCalls(record);
+  const responses = calls.filter(call => call.args[0] === 'response');
+  const firstPlugin = responses.find(call => call.args[1] === '/api/plugin');
+  const infoRequest = responses.find(call => call.args[1] === '/api/info');
+  assert.ok(firstPlugin && infoRequest && firstPlugin.at < infoRequest.at,
+    'the location-scoped plugin warm-up must happen before the bounded startup wait');
+  assert.equal(firstPlugin.returnedEntries, 0, 'fixture must begin with an empty location catalog');
+  assert.ok(responses.some(call => call.args[1] === '/api/agent' && call.returnedEntries === 1 &&
+    call.elapsedSinceLocationWarmup >= 1000),
+  'the no-options check must exercise the delayed location after it activates');
+});
+
 test('smoke accepts a configured plugin directory containing its loaded entrypoint', async t => {
   const f = fixture(t);
   const record = writeSmokeOpenCode(f, { plugins: { data: [
@@ -807,7 +855,7 @@ test('smoke accepts a configured plugin directory containing its loaded entrypoi
     '  *"/api/plugin")\n    count=0; [ ! -f ' + JSON.stringify(refreshCount) +
     ' ] || count=$(cat ' + JSON.stringify(refreshCount) + ')\n' +
     '    count=$((count + 1)); printf \'%s\' "$count" > ' + JSON.stringify(refreshCount) +
-    '\n    [ "$count" -le 2 ] || exit 124\n    ;;\nesac\nexec "$@"\n',
+    '\n    [ "$count" -le 3 ] || exit 124\n    ;;\nesac\nexec "$@"\n',
     { mode: 0o755 });
   const result = await runSmokeAsync(f, ['--require-plugin', '/fixture/plugins'],
     smokeEnvironment(f, record));
@@ -841,6 +889,66 @@ test('smoke reports API failure without echoing service stderr or response data'
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /API request failed: \/api\/info \(exit status: 22\)/);
   assert.doesNotMatch(result.stdout + result.stderr, /PRIVATE_API_ERROR_FIXTURE/);
+  const serveCall = smokeCalls(record).find(call => call.args[0] === 'serve');
+  assert.ok(serveCall, 'the failing check must have started its owned server');
+  assert.throws(() => process.kill(serveCall.pid, 0), { code: 'ESRCH' },
+    'failure cleanup stops its owned private server');
+  assert.deepEqual(fs.readdirSync(path.join(f.tmpdir, 'opencode')), [],
+    'failure cleanup removes its private workspace');
+});
+
+test('smoke cleanup stops its owned server and removes its workspace after TERM', async t => {
+  const f = fixture(t);
+  const record = writeSmokeOpenCode(f);
+  const child = spawn('bash', [path.join(repo, 'tests/opencode-smoke.sh')], {
+    cwd: f.projectDir, env: smokeEnvironment(f, record), stdio: ['ignore', 'pipe', 'pipe'], detached: true,
+  });
+  let stdout = ''; let stderr = '';
+  child.stdout.setEncoding('utf8').on('data', chunk => { stdout += chunk; });
+  child.stderr.setEncoding('utf8').on('data', chunk => { stderr += chunk; });
+  const closed = new Promise(resolve => child.once('close', (status, signal) => resolve({ status, signal })));
+  t.after(async () => {
+    if (child.exitCode !== null || child.signalCode !== null) return;
+    child.kill('SIGTERM');
+    let timer;
+    const result = await Promise.race([
+      closed,
+      new Promise(resolve => { timer = setTimeout(() => resolve(undefined), 5000); }),
+    ]);
+    clearTimeout(timer);
+    if (!result) {
+      try {
+        const serveCall = smokeCalls(record).find(call => call.args[0] === 'serve');
+        if (serveCall) process.kill(serveCall.pid, 'SIGTERM');
+      } catch { /* The fixture may have exited before recording a server. */ }
+      try { process.kill(-child.pid, 'SIGKILL'); } catch { /* The owned process group may already be gone. */ }
+      await closed;
+    }
+  });
+
+  const calls = await waitForSmokeCall(record, call =>
+    call.args[0] === 'http' && call.args[1] === 'GET' && call.args[2] === '/api/plugin');
+  assert.ok(calls, `the smoke check did not reach its private server\n${stdout}\n${stderr}`);
+  const serveCall = calls.find(call => call.args[0] === 'serve');
+  assert.ok(serveCall, 'the smoke check must have started its owned server');
+  assert.equal(child.kill('SIGTERM'), true, 'the running smoke check must accept TERM');
+
+  let timer;
+  const result = await Promise.race([
+    closed,
+    new Promise(resolve => { timer = setTimeout(() => resolve(undefined), 5000); }),
+  ]);
+  clearTimeout(timer);
+  if (!result) {
+    child.kill('SIGKILL');
+    await closed;
+  }
+  assert.ok(result, `the smoke check did not exit after TERM\n${stdout}\n${stderr}`);
+  assert.equal(result.status, 143, `${stdout}\n${stderr}`);
+  assert.throws(() => process.kill(serveCall.pid, 0), { code: 'ESRCH' },
+    'signal cleanup stops its owned private server');
+  assert.deepEqual(fs.readdirSync(path.join(f.tmpdir, 'opencode')), [],
+    'signal cleanup removes its private workspace');
 });
 
 test('smoke reports only requested plugin status when a readiness refresh times out', async t => {
@@ -853,7 +961,7 @@ case "$*" in
   *"/api/plugin")
     count=0; [ ! -f '${countFile}' ] || count=$(cat '${countFile}')
     count=$((count + 1)); printf '%s' "$count" > '${countFile}'
-    [ "$count" -le 1 ] || exit 124
+    [ "$count" -le 2 ] || exit 124
     ;;
 esac
 exec "$@"
@@ -877,6 +985,8 @@ test('OpenCode documentation records its sharing boundary, host networking, and 
   ]) assert.ok(readme.includes(phrase), `README is missing: ${phrase}`);
   assert.ok(/OpenCode dependency helper.*selected OpenCode version changes/.test(readme),
     'README must include helper and version rebuilds');
+  assert.match(readme, /Without\s+catalog requirements it reports endpoint reachability only; it does not claim\s+catalog initialization or print counts/);
+  assert.match(notes, /Without catalog requirements the\s+checker is endpoint-only.*does\s+not claim catalogs initialized or print entry counts/s);
   for (const phrase of ['OpenCode V2', 'dependency helper', 'runtime/service state remains container-local', 'Herdr']) {
     assert.ok(notes.includes(phrase), `Development notes are missing: ${phrase}`);
   }

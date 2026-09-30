@@ -199,9 +199,12 @@ forwarded when available. Claude networking and launch behavior are unchanged.
 
 The `--server` option conflicts with AgentBox-managed private-server execution.
 For read-only validation, run `agentbox --tool opencode shell bash tests/opencode-smoke.sh [OPTIONS]`.
-It waits for catalog initialization, verifies the reported project location,
-and prints catalog counts plus requested integration statuses—not catalog
-bodies. It sends no prompt or session-control request.
+It warms the current project location before checking endpoints. Without
+catalog requirements it reports endpoint reachability only; it does not claim
+catalog initialization or print counts. Supply `--require-plugin`,
+`--require-agent`, `--require-skill`, `--require-command`, or MCP requirements
+to enable bounded readiness checks and final catalog counts/statuses. It sends
+no prompt or session-control request.
 
 ## Advanced Usage
 

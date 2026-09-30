@@ -2,11 +2,11 @@
 
 ## Status
 
-**DONE_WITH_CONCERNS (implementation; controller re-review pending)** — Fix round 1 replaces cold catalog sampling with bounded readiness and final location-checked snapshots. The real container now verifies every enumerated server plugin and configured agent/skill/command definition, the requested MCP states, and Meridian's live catalog. Full host parity remains unestablished because renderer-only CLI-plugin success is inconclusive and the real `.env` selector fixture remains blocked by Safety Net.
+**Fix round 2 implementation committed; controller re-review pending.** The no-requirements path now warms location before waiting and remains endpoint-only, without catalog-readiness or count claims. Requirement runs retain bounded readiness and final location/status checks. The real container verifies configured server plugins, definitions, MCPs, and Meridian. Actual CLI-plugin activation remains inconclusive because the safe no-session renderer exposed no conclusive registration signal and the authorized fixture-session command was blocked before execution. The real `.env` selector fixture also remains blocked by Safety Net.
 
 ## Changes
 
-- Added `tests/opencode-smoke.sh`, an opt-in, read-only check for the selected V2 version, seven API endpoints, optional plugin/agent/skill/command/MCP expectations, Meridian's model catalog, and connection-only Herdr socket access. It creates one private child server with a temporary password, waits for catalog readiness, validates the returned project location, and reports final counts/statuses rather than bodies.
+- Added `tests/opencode-smoke.sh`, an opt-in, read-only check for the selected V2 version, seven API endpoints, optional plugin/agent/skill/command/MCP expectations, Meridian's model catalog, and connection-only Herdr socket access. It creates one private child server with a temporary password; requirement runs wait for catalog readiness and report final counts/statuses, while no-requirements runs validate endpoint envelopes/locations without claiming catalog readiness or counts.
 - Updated `README.md` and `DEVELOPMENT_NOTES.md` for selective mounts, shared config/data, isolated state/cache, host networking, private-server behavior, rebuild selection, and the smoke command.
 - Corrected managed API/run argument placement for OpenCode 2.0.19 and added the Meridian config home alias required by its discovered root dependency.
 - Fixed managed OpenCode launches being short-circuited when the noninteractive `zsh -c` source of `~/.zshrc` returns nonzero. A regression test covers the failure; Claude retains its original `&&` gate.
@@ -28,7 +28,7 @@
 - Server-plugin, configured-definition, and MCP parity are verified by the Fix round 1 checks below. The renderer-only provider-indicator/Herdr CLI activation result remains inconclusive and is not inferred from server catalogs.
 - A port-4096-only host check was incomplete. Fix round 1 scanned all host TCP listeners and found an existing OpenCode-owned loopback listener on port `49374`; process/state evidence below distinguishes it from the ephemeral managed container server. No host service was contacted, started, stopped, or modified.
 - A real `.env` selector-override fixture launch was blocked by Safety Net (`secret.basename.env`). It was not retried or worked around and remains incomplete.
-- No prompts, paid requests, session selection/resumption, Herdr pane RPC, credential-content reads, or database repair was performed. Plugin declarations and definition filenames were used as read-only expectations; selected config/cache metadata was checked without reading auth or credential files. Smoke/TUI runs excluded project `.env` injection.
+- No prompts, paid requests, host session selection/resumption, Herdr pane RPC, credential-content reads, or database repair was performed. Plugin declarations and definition filenames were used as read-only expectations; selected config/cache metadata was checked without reading auth or credential files. Smoke/TUI runs excluded project `.env` injection. The round-2 synthetic fixture-session setup did not reach its POST step; no fixture session was created.
 
 ## Baseline verification (before fix round 1)
 
@@ -97,3 +97,53 @@
 - A second full real smoke verified the same final counts, all seven active server plugins, all **47/39/37** configured definitions, five connected InterBase MCPs, four disabled debugger MCPs, and Meridian. No host listener was contacted.
 - The real `.env` selector-override fixture remains blocked by Safety Net (`secret.basename.env`). It was not retried or bypassed. No prompt, paid request, session mutation, Herdr RPC, credential-content access, config repair, database access/repair, host-service mutation, or live SQLite hashing occurred.
 - Self-review for this fix round is by the task implementer. The controller's independent scoped re-review is pending; this report does not claim its approval.
+
+## Fix round 2/5: warm-up order, endpoint-only default, and remaining CLI gate
+
+### Checker and regression changes
+
+- Moved the first project-location-scoped `GET /api/plugin` ahead of the bounded startup wait. This request now performs the location warm-up before any wait; subsequent catalog reads still validate the returned working-directory location.
+- The no-requirements path now explicitly reports endpoint response-shape/location checks only. It does not claim catalog readiness or print entry counts. `README.md` and `DEVELOPMENT_NOTES.md` describe that distinction and reserve bounded readiness/final counts for requirement runs.
+- The new no-requirements fixture delays location-catalog population until one second after the first plugin request. It verifies the first plugin response is empty, the warm-up precedes `/api/info` and the wait, a later endpoint sees the populated agent catalog, and successful output makes no readiness/count claim.
+- Requirement-path regressions continue to cover delayed configured catalogs and final refreshed counts/statuses. Failure-path and TERM-interruption tests now verify that only the owned child process is stopped and the private workspace is removed.
+
+### RED/GREEN evidence
+
+- RED command, run before the implementation change:
+
+  ```bash
+  testtmp=$(mktemp -d "$PWD/.task4-test.XXXXXX") || exit 1
+  trap 'rm -rf -- "$testtmp"' EXIT
+  AGENTBOX_TEST_TMPDIR="$testtmp" NODE_PATH=/tmp/opencode/agentbox-dev/node_modules \
+    node --test --test-name-pattern='default smoke warms the location' tests/agentbox.test.cjs
+  ```
+
+  Result: **1 failed** as intended. The no-options smoke succeeded while reporting plugin **0** and agent **0**, and did not emit the new endpoint-only disclaimer.
+- GREEN focused command after the change:
+
+  ```bash
+  testtmp=$(mktemp -d "$PWD/.task4-test.XXXXXX")
+  trap 'rm -rf -- "$testtmp"' EXIT
+  AGENTBOX_TEST_TMPDIR="$testtmp" NODE_PATH=/tmp/opencode/agentbox-dev/node_modules \
+    node --test --test-name-pattern='smoke cleanup|smoke reports API failure|default smoke warms|documentation records' \
+    tests/agentbox.test.cjs
+  ```
+
+  Result: **4 passed, 0 failed**, including the delayed-location, API-failure cleanup, TERM cleanup, and documentation-alignment checks.
+- Final suite command:
+
+  ```bash
+  testtmp=$(mktemp -d "$PWD/.task4-test.XXXXXX")
+  trap 'rm -rf -- "$testtmp"' EXIT
+  AGENTBOX_TEST_TMPDIR="$testtmp" NODE_PATH=/tmp/opencode/agentbox-dev/node_modules \
+    node --test tests/*.test.cjs
+  ```
+
+  Result: **68 passed, 0 failed**. `bash -n agentbox entrypoint.sh tests/opencode-smoke.sh`, `node --check opencode-dependencies.cjs`, `node --check tests/agentbox.test.cjs`, `shellcheck tests/opencode-smoke.sh`, and `git diff --check` all passed.
+
+### Isolated renderer evidence and blocker
+
+- One bounded renderer-only launch used the actual `agentbox:latest` image (**OpenCode 2.0.19**) with `docker run --rm --network=none`, a container-local executable `/tmp` tmpfs, fresh `HOME` and `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`, and `XDG_CACHE_HOME` below that temp root, and an isolated project. The actual `herdr-opencode`, its imported `herdr-tui-session.js`, and `provider-indicator` sources were bind-mounted read-only. A temporary global `cli.json` listed those two configured sources. `OPENCODE_CONFIG_DIR` pointed into the isolated home; `HERDR_ENV=0`; `OPENCODE_DISABLE_AUTOUPDATE=1`; `OPENCODE_DISABLE_MODELS_FETCH=1`; `OPENCODE_SESSION_ID`, `OPENCODE_SESSION`, all Herdr pane/tab/workspace/session identifiers, and `HERDR_SOCKET_PATH` were unset. The renderer received no input and ran under `timeout --signal=INT --kill-after=2s 6s script -qefc 'stty cols 160 rows 45; exec opencode --standalone --log-level trace --print-logs' ...`; it ended with status **137** after the bound.
+- Sanitized trace summary: **22** provider-indicator name references and **22** Herdr name references; **0** categorized load/registration success markers and **0** categorized failure markers. `Rte: OpenAI` was absent. This was a no-session screen: absence of its prompt-footer slot is not treated as plugin failure, and the trace does not prove completed registration.
+- A separate isolated preflight used static `agents.orchestrator.model = openai/gpt-4.1-mini` metadata and an owned private server. Its read-only `GET /api/agent` did not return a successful response (curl exit **22**), so it sent no `POST /api/session`. A subsequent attempt to execute the controller-authorized disposable fixture-session procedure was blocked by CC Safety Net because it could not verify the shell-command source. Per that denial, the command was not retried or restructured to bypass the guard; no fixture session was created. The documented non-generating session API path is therefore not yet verified against this image.
+- Actual provider-indicator/Herdr CLI activation remains a mandatory unresolved gate for controller re-review. The real `.env` selector-override fixture remains blocked by the separate Safety Net denial (`secret.basename.env`) and was not retried or bypassed. No host config/plugin source, host session, credential, host listener, or database was modified or contacted in this round.

@@ -133,7 +133,6 @@ while ((SECONDS < deadline)); do
     sleep 0.2
 done
 [[ -n "$server_url" ]] || smoke_error 'Timed out waiting for the private OpenCode server.'
-catalog_readiness_floor=$((SECONDS + 3))
 
 api_get() {
     local endpoint=$1 remaining=$((deadline - SECONDS))
@@ -203,6 +202,15 @@ validate_json() {
         smoke_error "Invalid API response: $endpoint (class: $response_class, JSON type: $response_type, API error: $api_error)"
     fi
 }
+
+if fetch_catalog plugin; then
+    :
+else
+    request_status=$?
+    [[ "$request_status" == 124 ]] && smoke_error 'Timed out warming the project catalog location.'
+    smoke_error 'Could not warm the project catalog location.'
+fi
+catalog_readiness_floor=$((SECONDS + 3))
 
 while ((SECONDS < catalog_readiness_floor && SECONDS < deadline)); do
     sleep 0.3
@@ -341,29 +349,28 @@ if ((has_requirements)); then
         done
         smoke_error 'Requested integrations did not reach their expected states within the readiness deadline.'
     fi
-else
-    if refresh_catalogs; then
-        :
-    else
-        request_status=$?
-        [[ "$request_status" == 124 ]] && smoke_error 'Timed out refreshing API catalogs.'
-        smoke_error 'Could not refresh API catalogs.'
-    fi
 fi
 
 printf 'Verified catalog location: %s\n' 'current working directory'
-for endpoint in plugin agent skill command model mcp; do
-    case "$endpoint" in
-        plugin) response=$plugins_json ;;
-        agent) response=$agents_json ;;
-        skill) response=$skills_json ;;
-        command) response=$commands_json ;;
-        model) response=$models_json ;;
-        mcp) response=$mcps_json ;;
-    esac
-    catalog_count=$(jq -r '.data | length' <<<"$response")
-    printf 'Verified API endpoint: %s (%s entries)\n' "$endpoint" "$catalog_count"
-done
+if ((has_requirements)); then
+    for endpoint in plugin agent skill command model mcp; do
+        case "$endpoint" in
+            plugin) response=$plugins_json ;;
+            agent) response=$agents_json ;;
+            skill) response=$skills_json ;;
+            command) response=$commands_json ;;
+            model) response=$models_json ;;
+            mcp) response=$mcps_json ;;
+        esac
+        catalog_count=$(jq -r '.data | length' <<<"$response")
+        printf 'Verified API endpoint: %s (%s entries)\n' "$endpoint" "$catalog_count"
+    done
+else
+    printf 'Catalog readiness and entry counts were not assessed (no catalog requirements supplied).\n'
+    for endpoint in plugin agent skill command model mcp; do
+        printf 'Verified API endpoint: %s (response shape and location valid; entries not assessed)\n' "$endpoint"
+    done
+fi
 
 for name in "${required_plugins[@]}"; do
     printf 'Verified plugin: %s (active)\n' "$name"

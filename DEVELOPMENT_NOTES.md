@@ -101,16 +101,18 @@ $PROJECT_DIR            # Project directory (mounted at full host path)
 
 The opt-in read-only OpenCode smoke runs inside an OpenCode-selected shell:
 `agentbox --tool opencode shell bash tests/opencode-smoke.sh [OPTIONS]`.
-It waits for startup and requested readiness, refreshes all six catalogs, and
-checks that each reports the current project location. It can require plugin
-IDs/sources, agent/skill/command IDs, and MCP statuses with `--require-plugin`,
-`--require-agent`, `--require-skill`, `--require-command`, `--require-mcp`,
-`--disabled-mcp`, and `--meridian-url`. It prints catalog counts and requested
-statuses, never catalog bodies. It starts and cleans up only its own
-container-local private server, sends no prompts or session-control requests,
-and uses a temporary password for authenticated read-only HTTP GETs. When
-Herdr is active, it opens the forwarded socket without sending RPC data or
-changing a pane/session.
+It first warms the current project location. Without catalog requirements the
+checker is endpoint-only: it checks endpoint responses and location, but does
+not claim catalogs initialized or print entry counts. Supplying plugin,
+agent/skill/command, or MCP requirements enables bounded readiness polling,
+final location/status checks, and catalog counts. Supported options are
+`--require-plugin`, `--require-agent`, `--require-skill`, `--require-command`,
+`--require-mcp`, `--disabled-mcp`, and `--meridian-url`. The checker never
+prints catalog bodies. It starts and cleans up only its own container-local
+private server, sends no prompts or session-control requests, and uses a
+temporary password for authenticated read-only HTTP GETs. When Herdr is
+active, it opens the forwarded socket without sending RPC data or changing a
+pane/session.
 
 ## Potential Future Improvements
 
