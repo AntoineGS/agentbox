@@ -495,6 +495,23 @@ build_container_cmd() {
     fi
 }
 
+# source_ref returns the mapped path through the caller's nameref.
+# shellcheck disable=SC2034
+resolve_opencode_mount_source() {
+    local -n source_ref="$1" source_registry_ref="$2"
+    local requested destination signature longest=0
+    requested=$(realpath -ms -- "$3") || return 1
+    source_ref="$requested"
+    for destination in "${!source_registry_ref[@]}"; do
+        if is_path_within "$requested" "$destination" && (( ${#destination} > longest )); then
+            signature=${source_registry_ref[$destination]}
+            source_ref="${signature%:*}${requested#"$destination"}"
+            longest=${#destination}
+        fi
+    done
+    return 0
+}
+
 append_opencode_mount() {
     local -n output_ref="$1" registry_ref="$5"
     local source destination="$3" mode="$4"
@@ -505,7 +522,8 @@ append_opencode_mount() {
         log_error "Unsupported OpenCode mount path or mode."
         return 1
     fi
-    source=$(realpath -e -- "$2") || {
+    resolve_opencode_mount_source source "$5" "$2" || return 1
+    source=$(realpath -e -- "$source") || {
         log_error "Missing OpenCode dependency: $2"
         return 1
     }
@@ -581,7 +599,8 @@ find_opencode_package_root() {
 mount_opencode_readonly_file_aliases() {
     local output_name="$1" registry_name="$2" lexical_file="$3"
     local canonical_file alias_source alias_destination relative candidate index
-    canonical_file=$(realpath -e -- "$lexical_file") || {
+    resolve_opencode_mount_source canonical_file "$registry_name" "$lexical_file" || return 1
+    canonical_file=$(realpath -e -- "$canonical_file") || {
         log_error "Missing OpenCode dependency: $lexical_file"
         return 1
     }
@@ -709,6 +728,7 @@ build_opencode_mounts() {
         append_opencode_mount probe_mounts "$candidate" "$candidate" ro probe_registry || return 1
         scan_args+=(--scan "$candidate")
     done
+    append_opencode_mount probe_mounts "$config" /home/agent/.config/opencode ro probe_registry || return 1
     for candidate in "$HOME/.claude/skills" "$HOME/.agents/skills"; do
         if [[ -d "$candidate" ]]; then
             append_opencode_mount probe_mounts "$candidate" "$candidate" ro probe_registry || return 1
@@ -773,7 +793,7 @@ build_opencode_mounts() {
     trap 'rm -rf -- "$probe_dir"; if [[ -n "$previous_return_trap" ]]; then eval "$previous_return_trap"; else trap - RETURN; fi' RETURN
     local -a probe_runtime_args=()
     [[ "$RUNTIME" == podman ]] && probe_runtime_args+=(--userns=keep-id)
-    local pass=0 changed=true record_mode record_role record_required dependency
+    local pass=0 changed=true record_mode record_role record_required dependency dependency_source probe_source
     while [[ "$changed" == true && $pass -lt 32 ]]; do
         pass=$((pass + 1)); changed=false
         # shellcheck disable=SC2016
@@ -800,12 +820,13 @@ build_opencode_mounts() {
                 log_error "Invalid OpenCode dependency manifest record."
                 return 1
             fi
-            if [[ "$record_required" == 1 && ! -e "$dependency" ]]; then
+            resolve_opencode_mount_source dependency_source registry "$dependency" || return 1
+            if [[ "$record_required" == 1 && ! -e "$dependency_source" ]]; then
                 log_error "Missing OpenCode dependency: $dependency"
                 return 1
             fi
-            if [[ "$record_role" == plugin && -f "$dependency" ]]; then
-                local package_root plugin_entry="$dependency"
+            if [[ "$record_role" == plugin && -f "$dependency_source" ]]; then
+                local package_root plugin_entry="$dependency_source"
                 if [[ -L "$plugin_entry" ]]; then
                     all_records["$plugin_entry"]='ro:symlink:1'
                     if [[ -z "${probe_registry[$plugin_entry]+present}" ]]; then
@@ -858,13 +879,15 @@ build_opencode_mounts() {
             else
                 all_records["$dependency"]="$record_mode:$record_role:$record_required"
             fi
-            if [[ -e "$dependency" ]]; then
+            resolve_opencode_mount_source dependency_source registry "$dependency" || return 1
+            if [[ -e "$dependency_source" ]]; then
                 local lexical="$dependency"
                 local canonical
-                canonical=$(realpath -e -- "$dependency") || { log_error "Missing OpenCode dependency: $dependency"; return 1; }
+                canonical=$(realpath -e -- "$dependency_source") || { log_error "Missing OpenCode dependency: $dependency"; return 1; }
                 for source in "$lexical" "$canonical"; do
                     if [[ -z "${probe_registry[$source]+present}" ]]; then
-                        append_opencode_mount probe_mounts "$source" "$source" ro probe_registry || return 1
+                        resolve_opencode_mount_source probe_source registry "$source" || return 1
+                        append_opencode_mount probe_mounts "$probe_source" "$source" ro probe_registry || return 1
                         scan_args+=(--scan "$source")
                         changed=true
                     fi
@@ -884,14 +907,15 @@ build_opencode_mounts() {
         local details=${all_records[$dependency]} mode=${all_records[$dependency]%%:*}
         local role=${details#*:}; role=${role%%:*}
         local required=${details##*:}
-        if [[ "$required" == 0 && ! -e "$dependency" ]]; then continue; fi
+        resolve_opencode_mount_source dependency_source registry "$dependency" || return 1
+        if [[ "$required" == 0 && ! -e "$dependency_source" ]]; then continue; fi
         [[ "$role" == file ]] && continue
         if is_opencode_writable_path "$dependency"; then continue; fi
         destination="$dependency"
         append_opencode_mount "$output_name" "$dependency" "$destination" "$mode" registry || return 1
-        if [[ "$role" == root && -d "$dependency" ]]; then
+        if [[ "$role" == root && -d "$dependency_source" ]]; then
             local canonical_root
-            canonical_root=$(realpath -e -- "$dependency") || return 1
+            canonical_root=$(realpath -e -- "$dependency_source") || return 1
             if [[ "$canonical_root" != "$dependency" ]]; then
                 append_opencode_mount "$output_name" "$dependency" "$canonical_root" "$mode" registry || return 1
             fi
@@ -908,7 +932,8 @@ build_opencode_mounts() {
         role=${role%%:*}
         [[ "$role" == file ]] || continue
         local required=${details##*:}
-        if [[ "$required" == 0 && ! -e "$dependency" ]]; then continue; fi
+        resolve_opencode_mount_source dependency_source registry "$dependency" || return 1
+        if [[ "$required" == 0 && ! -e "$dependency_source" ]]; then continue; fi
         mount_opencode_readonly_file_aliases "$output_name" registry "$dependency" || return 1
     done < <(printf '%s\n' "${ordered[@]}" | LC_ALL=C sort)
     if [[ -n "$previous_return_trap" ]]; then eval "$previous_return_trap"; else trap - RETURN; fi

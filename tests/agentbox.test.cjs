@@ -46,9 +46,12 @@ if (${mountVisible}) {
   const mounts = [];
   for (let i = 2; i < marker; i++) {
     if (process.argv[i] === '-v') {
-      const [source, destination] = process.argv[++i].split(':');
-      mounts.push({ source, destination });
+      const [source, destination, mode] = process.argv[++i].split(':');
+      mounts.push({ source, destination, mode });
     }
+  }
+  if (${JSON.stringify(f.probeRecord || '')}) {
+    require('node:fs').appendFileSync(${JSON.stringify(f.probeRecord || '')}, JSON.stringify(mounts) + '\\n');
   }
   require(${JSON.stringify(path.join(repo, 'tests/probe-visible-fs.cjs'))})(mounts);
   const { values } = require('node:util').parseArgs({ args: process.argv.slice(marker + 1), options: {
@@ -469,6 +472,120 @@ test('real helper closure mounts nested plugin package and multilevel external l
   assert.ok(result.stdout.includes(`${externalPlugin}:${externalPlugin}:ro`));
   assert.ok(!result.stdout.includes(`${siblingRepo}:${siblingRepo}:`));
   assert.ok(!result.stdout.includes(`${externalSibling}:${externalSibling}:`));
+});
+
+test('runtime alias real-helper closure follows nested provider and Herdr links without broadening mounts', t => {
+  const f = fixture(t);
+  const canonical = path.join(f.home, 'configs/opencode'); fs.mkdirSync(canonical, { recursive: true });
+  const config = path.join(f.home, '.config/opencode'); fs.mkdirSync(path.dirname(config)); fs.symlinkSync(canonical, config);
+  const containerConfig = '/home/agent/.config/opencode';
+  const plugins = ['cli-plugins/provider-indicator', 'herdr-opencode'];
+  for (const relative of plugins) {
+    const plugin = path.join(canonical, relative); fs.mkdirSync(plugin, { recursive: true });
+    fs.writeFileSync(path.join(plugin, 'index.js'), 'fixture code; NEVER_EXECUTE');
+    fs.symlinkSync(`${containerConfig}/${relative}`, path.join(plugin, path.basename(plugin)));
+  }
+  fs.writeFileSync(path.join(canonical, 'cli.json'), JSON.stringify({ plugins: plugins.map(p => `./${p}`) }));
+  const sibling = path.join(f.home, 'configs/unrelated'); fs.mkdirSync(sibling);
+  f.probeRecord = path.join(f.home, 'probe-mounts.jsonl');
+  useRealDependencyHelper(f, true);
+  const result = bash(f, 'RUNTIME=runtime; declare -a output=(); build_opencode_mounts output runtime_alias; printf "%s\\n" "${output[@]}"');
+  assert.equal(result.status, 0, result.stderr);
+  const firstProbe = JSON.parse(fs.readFileSync(f.probeRecord, 'utf8').split('\n')[0]);
+  assert.ok(firstProbe.some(m => m.source === canonical && m.destination === containerConfig && m.mode === 'ro'));
+  assertMountVisibleFiles(result.stdout, plugins.flatMap(p => [
+    [`${containerConfig}/${p}/index.js`, 'fixture code; NEVER_EXECUTE'],
+    [path.join(config, p, path.basename(p), 'index.js'), 'fixture code; NEVER_EXECUTE'],
+  ]), [f.home, '/home/agent', path.dirname(canonical), sibling]);
+  assert.ok(result.stdout.includes(`${canonical}:${containerConfig}:rw`));
+  assert.ok(!result.stdout.includes(`${canonical}/cli-plugins/provider-indicator:${containerConfig}/cli-plugins/provider-indicator:`));
+  assert.doesNotMatch(result.stderr, /NEVER_EXECUTE/);
+});
+
+test('runtime alias mount sources use the longest component-matched destination and retain aliases', t => {
+  const f = fixture(t);
+  const base = path.join(f.home, 'base'); const override = path.join(f.home, 'override');
+  fs.mkdirSync(path.join(base, 'plugins'), { recursive: true }); fs.mkdirSync(override);
+  fs.writeFileSync(path.join(base, 'plugins/entry.js'), 'wrong parent mapping');
+  const entry = path.join(override, 'entry.js'); fs.writeFileSync(entry, 'selected overlay');
+  const alias = '/home/agent/.config/opencode';
+  const result = bash(f, 'declare -a output=(); declare -A registry=(); ' +
+    'append_opencode_mount output "$HOME/base" /home/agent/.config/opencode ro registry; ' +
+    'append_opencode_mount output "$HOME/override" /home/agent/.config/opencode/plugins ro registry; ' +
+    'append_opencode_mount output /home/agent/.config/opencode/plugins/entry.js /home/agent/.config/opencode/plugins/entry.js ro registry; ' +
+    'printf "%s\\n" "${output[@]}"');
+  assert.equal(result.status, 0, result.stderr);
+  assert.ok(result.stdout.includes(`${entry}:${alias}/plugins/entry.js:ro`), result.stdout);
+  assertMountVisibleFiles(result.stdout, [[`${alias}/plugins/entry.js`, 'selected overlay']],
+    [f.home, '/home/agent', `${alias}-extra/entry.js`]);
+});
+
+test('runtime alias source matching does not translate paths escaping an approved destination', t => {
+  const f = fixture(t);
+  fs.mkdirSync(path.join(f.home, 'config'));
+  fs.mkdirSync(path.join(f.home, 'unrelated'));
+  fs.writeFileSync(path.join(f.home, 'unrelated/entry.js'), 'unapproved sibling');
+  const result = bash(f, 'declare -a output=(); declare -A registry=(); ' +
+    'append_opencode_mount output "$HOME/config" /home/agent/.config/opencode ro registry; ' +
+    'append_opencode_mount output /home/agent/.config/opencode/../unrelated/entry.js /home/agent/.config/unrelated/entry.js ro registry');
+  assert.notEqual(result.status, 0, result.stdout);
+  assert.match(result.stderr, /Missing OpenCode dependency/);
+});
+
+test('runtime alias file references retain readonly overlays at every writable config alias', t => {
+  const f = fixture(t);
+  const canonical = path.join(f.home, 'configs/opencode'); fs.mkdirSync(canonical, { recursive: true });
+  const config = path.join(f.home, '.config/opencode'); fs.mkdirSync(path.dirname(config)); fs.symlinkSync(canonical, config);
+  const containerConfig = '/home/agent/.config/opencode';
+  fs.writeFileSync(path.join(canonical, 'token'), 'CREDENTIAL_FIXTURE_NEVER_PRINT');
+  fs.writeFileSync(path.join(canonical, 'opencode.json'), JSON.stringify({ reference: `{file:${containerConfig}/token}` }));
+  useRealDependencyHelper(f, true);
+  const result = bash(f, 'RUNTIME=runtime; declare -a output=(); build_opencode_mounts output alias_file; printf "%s\\n" "${output[@]}"');
+  assert.equal(result.status, 0, result.stderr);
+  for (const destination of [config, canonical, containerConfig]) {
+    assert.ok(result.stdout.includes(`${canonical}/token:${destination}/token:ro`), result.stdout);
+  }
+  assert.doesNotMatch(result.stdout + result.stderr, /CREDENTIAL_FIXTURE_NEVER_PRINT/);
+  assertMountVisibleFiles(result.stdout, [[`${containerConfig}/token`, 'CREDENTIAL_FIXTURE_NEVER_PRINT']],
+    [f.home, '/home/agent', path.dirname(canonical)]);
+});
+
+for (const [name, target, role = 'symlink'] of [
+  ['missing mapped target', '/home/agent/.config/opencode/missing'],
+  ['missing mapped file', '/home/agent/.config/opencode/missing-token', 'file'],
+  ['unmapped container home', '/home/agent/unapproved/missing'],
+  ['sibling-prefix destination', '/home/agent/.config/opencode-extra/missing'],
+]) {
+  test(`runtime alias rejects ${name} instead of ignoring required dependencies`, t => {
+    const f = fixture(t);
+    const config = path.join(f.home, '.config/opencode'); fs.mkdirSync(config, { recursive: true });
+    if (role === 'file') {
+      fs.writeFileSync(path.join(config, 'opencode.json'), JSON.stringify({ reference: `{file:${target}}` }));
+    } else {
+      fs.symlinkSync(target, path.join(config, 'required-link'));
+    }
+    useRealDependencyHelper(f, true);
+    const result = bash(f, 'RUNTIME=runtime; declare -a output=(); build_opencode_mounts output missing_alias');
+    assert.notEqual(result.status, 0);
+    assert.ok(result.stderr.includes(`Missing OpenCode dependency: ${target}`), result.stderr);
+  });
+}
+
+test('runtime alias discovery still rejects closure expansion beyond 32 passes', t => {
+  const f = fixture(t);
+  for (let i = 1; i <= 32; i++) fs.mkdirSync(path.join(f.home, `dependency-${i}`));
+  const counter = path.join(f.home, 'passes');
+  fs.writeFileSync(path.join(f.bin, 'runtime'), `#!/usr/bin/env node
+const fs = require('node:fs');
+const counter = ${JSON.stringify(counter)};
+const pass = fs.existsSync(counter) ? Number(fs.readFileSync(counter, 'utf8')) + 1 : 1;
+fs.writeFileSync(counter, String(pass));
+process.stdout.write('ro\\troot\\t1\\t' + ${JSON.stringify(f.home)} + '/dependency-' + pass + '\\n');
+`, { mode: 0o755 });
+  const result = bash(f, 'RUNTIME=runtime; declare -a output=(); build_opencode_mounts output closure_limit');
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /OpenCode dependency closure exceeded 32 passes/);
+  assert.equal(fs.readFileSync(counter, 'utf8'), '32');
 });
 
 test('fix wave I1 mount-visible project and ancestor documents retain lexical declarations and link aliases', t => {
