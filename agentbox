@@ -821,6 +821,24 @@ build_opencode_mounts() {
                 else
                     dependency=${dependency%/*}
                 fi
+                if [[ ! -L "$plugin_entry" ]]; then
+                    local lexical_root lexical_root_real=
+                    find_opencode_package_root lexical_root "$plugin_entry" || return 1
+                    if [[ -n "$lexical_root" ]]; then
+                        lexical_root_real=$(realpath -e -- "$lexical_root") || return 1
+                    fi
+                    if [[ "$lexical_root_real" != "$dependency" ]]; then
+                        lexical_root=${plugin_entry%/*}
+                    fi
+                    if [[ -z "${all_records[$lexical_root]+present}" ]]; then
+                        all_records["$lexical_root"]='ro:plugin:1'
+                    fi
+                    if [[ -z "${probe_registry[$lexical_root]+present}" ]]; then
+                        append_opencode_mount probe_mounts "$lexical_root" "$lexical_root" ro probe_registry || return 1
+                        scan_args+=(--scan "$lexical_root")
+                        changed=true
+                    fi
+                fi
                 record_role=plugin
                 record_mode=ro
             fi

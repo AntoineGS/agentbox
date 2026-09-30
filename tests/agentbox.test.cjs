@@ -71,6 +71,25 @@ process.exit(result.status ?? 1);
   fs.writeFileSync(path.join(f.bin, 'runtime'), runtime, { mode: 0o755 });
 }
 
+function assertMountVisibleFiles(output, files, absent) {
+  const mounts = output.trim().split('\n').filter(line => line !== '-v').map(line => {
+    const [source, destination] = line.split(':');
+    return { source, destination };
+  });
+  const result = spawnSync(process.execPath, ['-e', `
+    const fs = require('node:fs');
+    const assert = require('node:assert/strict');
+    require(${JSON.stringify(path.join(repo, 'tests/probe-visible-fs.cjs'))})(${JSON.stringify(mounts)});
+    for (const [file, content] of ${JSON.stringify(files)}) {
+      assert.equal(fs.readFileSync(file, 'utf8'), content, file);
+    }
+    for (const file of ${JSON.stringify(absent)}) {
+      assert.throws(() => fs.statSync(file), { code: 'ENOENT' }, file);
+    }
+  `], { encoding: 'utf8' });
+  assert.equal(result.status, 0, result.stderr);
+}
+
 function smokeEnvironment(f, record, overrides = {}) {
   const env = { ...process.env, HOME: f.home, PATH: `${f.bin}:${process.env.PATH}`,
     TOOL: 'opencode', AGENTBOX_OPENCODE_VERSION: '2', RECORD: record,
@@ -492,6 +511,67 @@ test('fix wave I2 standalone explicit and auto-discovered plugin entries include
   assert.doesNotMatch(result.stdout + result.stderr, /NEVER_EXECUTE/);
 });
 
+for (const packaged of [true, false]) {
+  for (const multihop of [false, true]) {
+    test(`N1 mount-visible ${packaged ? 'package' : 'standalone'} plugin preserves ${multihop ? 'multihop' : 'single-hop'} directory alias and adjacent imports`, t => {
+      const f = fixture(t);
+      const config = path.join(f.home, '.config/opencode'); fs.mkdirSync(config, { recursive: true });
+      const code = path.join(f.home, 'code');
+      const selected = path.join(code, 'selected');
+      const alias = path.join(code, 'alias');
+      const links = path.join(f.home, 'links'); fs.mkdirSync(links);
+      const entryRelative = packaged ? 'dist/plugin.js' : 'plugin.js';
+      const entry = path.join(selected, entryRelative);
+      const lexicalEntry = path.join(alias, entryRelative);
+      const lexicalHelper = path.join(path.dirname(lexicalEntry), 'helper.js');
+      const pluginCode = "import './helper.js'; throw new Error('NEVER_EXECUTE');";
+      fs.mkdirSync(path.dirname(entry), { recursive: true });
+      fs.writeFileSync(entry, pluginCode);
+      fs.writeFileSync(path.join(path.dirname(entry), 'helper.js'), 'adjacent fixture');
+      if (packaged) fs.writeFileSync(path.join(selected, 'package.json'), '{"name":"selected"}');
+      const sibling = path.join(code, 'unrelated'); fs.mkdirSync(sibling);
+      const linkSibling = path.join(links, 'unrelated'); fs.mkdirSync(linkSibling);
+      const middle = path.join(links, 'middle');
+      if (multihop) fs.symlinkSync(selected, middle);
+      fs.symlinkSync(multihop ? middle : selected, alias);
+      fs.writeFileSync(path.join(config, 'opencode.json'), JSON.stringify({ plugins: [lexicalEntry] }));
+      useRealDependencyHelper(f, true);
+      const result = bash(f, 'RUNTIME=runtime; declare -a output=(); build_opencode_mounts output lexical; printf "%s\\n" "${output[@]}"');
+      assert.equal(result.status, 0, result.stderr);
+      const files = [[lexicalEntry, pluginCode], [lexicalHelper, 'adjacent fixture'],
+        [entry, pluginCode], [path.join(path.dirname(entry), 'helper.js'), 'adjacent fixture']];
+      if (packaged) files.push([path.join(alias, 'package.json'), '{"name":"selected"}']);
+      assertMountVisibleFiles(result.stdout, files, [f.home, code, links, sibling, linkSibling]);
+      assert.ok(result.stdout.includes(`${selected}:${alias}:ro`), result.stdout);
+      assert.ok(result.stdout.includes(`${selected}:${selected}:ro`), result.stdout);
+      assert.doesNotMatch(result.stdout + result.stderr, /NEVER_EXECUTE/);
+    });
+  }
+}
+
+test('N1 mount-visible alias into package subdirectory does not expand an unrelated lexical package ancestor', t => {
+  const f = fixture(t);
+  const config = path.join(f.home, '.config/opencode'); fs.mkdirSync(config, { recursive: true });
+  const selected = path.join(f.home, 'selected'); fs.mkdirSync(path.join(selected, 'dist'), { recursive: true });
+  const code = path.join(f.home, 'code'); fs.mkdirSync(code);
+  const alias = path.join(code, 'alias'); fs.symlinkSync(path.join(selected, 'dist'), alias);
+  const sibling = path.join(code, 'unrelated'); fs.mkdirSync(sibling);
+  fs.writeFileSync(path.join(code, 'package.json'), '{"name":"unrelated-ancestor"}');
+  fs.writeFileSync(path.join(selected, 'package.json'), '{"name":"selected"}');
+  const pluginCode = "import './helper.js'; throw new Error('NEVER_EXECUTE');";
+  fs.writeFileSync(path.join(selected, 'dist/plugin.js'), pluginCode);
+  fs.writeFileSync(path.join(selected, 'dist/helper.js'), 'adjacent fixture');
+  fs.writeFileSync(path.join(config, 'opencode.json'), JSON.stringify({ plugins: [path.join(alias, 'plugin.js')] }));
+  useRealDependencyHelper(f, true);
+  const result = bash(f, 'RUNTIME=runtime; declare -a output=(); build_opencode_mounts output subdirectory; printf "%s\\n" "${output[@]}"');
+  assert.equal(result.status, 0, result.stderr);
+  assertMountVisibleFiles(result.stdout, [[path.join(alias, 'plugin.js'), pluginCode],
+    [path.join(alias, 'helper.js'), 'adjacent fixture'],
+    [path.join(selected, 'package.json'), '{"name":"selected"}']], [f.home, code, sibling]);
+  assert.ok(result.stdout.includes(`${selected}/dist:${alias}:ro`), result.stdout);
+  assert.doesNotMatch(result.stdout + result.stderr, /NEVER_EXECUTE/);
+});
+
 test('fix wave I2 multihop automatic plugin file aliases do not expand intermediate ancestors', t => {
   const f = fixture(t);
   const config = path.join(f.home, '.config/opencode'); fs.mkdirSync(path.join(config, 'plugins'), { recursive: true });
@@ -506,6 +586,8 @@ test('fix wave I2 multihop automatic plugin file aliases do not expand intermedi
   assert.ok(result.stdout.includes(`${selected}:${selected}:ro`), result.stdout);
   assert.ok(result.stdout.includes(`${entry}:${middle}:ro`), result.stdout);
   assert.ok(!result.stdout.includes(`${f.home}:${f.home}:`));
+  assertMountVisibleFiles(result.stdout, [[middle, "import './helper.js';"],
+    [path.join(selected, 'helper.js'), 'fixture']], [f.home, path.join(f.home, 'code')]);
 });
 
 test('fix wave I3 regular node_modules linked dependency trees close without unrelated workspaces', t => {
