@@ -623,13 +623,16 @@ find_opencode_package_root() {
     # The nameref writes the detected package root to the caller's variable.
     # shellcheck disable=SC2034
     local -n root_ref="$1"
-    local file="$2" directory depth=0
+    local file="$2" file_source="$2" package_file directory depth=0
     root_ref=""
-    [[ -f "$file" ]] || return 0
+    if [[ -n "${3:-}" ]]; then resolve_opencode_mount_source file_source "$3" "$file" || return 1; fi
+    [[ -f "$file_source" ]] || return 0
     directory=${file%/*}
     [[ -n "$directory" ]] || directory=/
     while (( depth < 16 )); do
-        if [[ -f "$directory/package.json" ]]; then
+        package_file="$directory/package.json"
+        if [[ -n "${3:-}" ]]; then resolve_opencode_mount_source package_file "$3" "$package_file" || return 1; fi
+        if [[ -f "$package_file" ]]; then
             root_ref="$directory"
             return 0
         fi
@@ -870,27 +873,29 @@ build_opencode_mounts() {
                 return 1
             fi
             if [[ "$record_role" == plugin && -f "$dependency_source" ]]; then
-                local package_root plugin_entry="$dependency_source"
-                if [[ -L "$plugin_entry" ]]; then
+                local package_root plugin_entry="$dependency" plugin_is_link=false
+                if [[ -L "$plugin_entry" || -L "$dependency_source" ]]; then
+                    plugin_is_link=true
                     all_records["$plugin_entry"]='ro:symlink:1'
                     if [[ -z "${probe_registry[$plugin_entry]+present}" ]]; then
-                        append_opencode_mount probe_mounts "$plugin_entry" "$plugin_entry" ro probe_registry || return 1
+                        append_opencode_mount probe_mounts "$dependency_source" "$plugin_entry" ro probe_registry || return 1
                         scan_args+=(--scan "$plugin_entry")
                         changed=true
                     fi
                 fi
-                dependency=$(realpath -e -- "$plugin_entry") || return 1
+                dependency=$(realpath -e -- "$dependency_source") || return 1
                 find_opencode_package_root package_root "$dependency" || return 1
                 if [[ -n "$package_root" ]]; then
                     dependency="$package_root"
                 else
                     dependency=${dependency%/*}
                 fi
-                if [[ ! -L "$plugin_entry" ]]; then
+                if [[ "$plugin_is_link" == false ]]; then
                     local lexical_root lexical_root_real=
-                    find_opencode_package_root lexical_root "$plugin_entry" || return 1
+                    find_opencode_package_root lexical_root "$plugin_entry" registry || return 1
                     if [[ -n "$lexical_root" ]]; then
-                        lexical_root_real=$(realpath -e -- "$lexical_root") || return 1
+                        resolve_opencode_mount_source lexical_root_real registry "$lexical_root" || return 1
+                        lexical_root_real=$(realpath -e -- "$lexical_root_real") || return 1
                     fi
                     if [[ "$lexical_root_real" != "$dependency" ]]; then
                         lexical_root=${plugin_entry%/*}

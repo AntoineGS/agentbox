@@ -75,12 +75,12 @@ process.exit(result.status ?? 1);
   fs.writeFileSync(path.join(f.bin, 'runtime'), runtime, { mode: 0o755 });
 }
 
-function assertMountVisibleFiles(output, files, absent) {
+function assertMountVisibleFiles(output, files, absent, moduleEntry) {
   const mounts = output.trim().split('\n').filter(line => line !== '-v').map(line => {
     const [source, destination] = line.split(':');
     return { source, destination };
   });
-  const result = spawnSync(process.execPath, ['-e', `
+  const result = spawnSync(process.execPath, [...(moduleEntry ? ['--experimental-vm-modules'] : []), '-e', `
     const fs = require('node:fs');
     const assert = require('node:assert/strict');
     require(${JSON.stringify(path.join(repo, 'tests/probe-visible-fs.cjs'))})(${JSON.stringify(mounts)});
@@ -89,6 +89,26 @@ function assertMountVisibleFiles(output, files, absent) {
     }
     for (const file of ${JSON.stringify(absent)}) {
       assert.throws(() => fs.statSync(file), { code: 'ENOENT' }, file);
+    }
+    if (${JSON.stringify(moduleEntry || null)}) {
+      (async () => {
+        const path = require('node:path');
+        const { SourceTextModule } = require('node:vm');
+        const modules = new Map();
+        async function load(file) {
+          if (modules.has(file)) return modules.get(file);
+          const module = new SourceTextModule(fs.readFileSync(file, 'utf8'), { identifier: file });
+          modules.set(file, module);
+          await module.link((specifier, parent) => {
+            assert.ok(specifier.startsWith('./') || specifier.startsWith('../'));
+            return load(path.resolve(path.dirname(parent.identifier), specifier));
+          });
+          return module;
+        }
+        const module = await load(${JSON.stringify(moduleEntry || '')});
+        await module.evaluate();
+        assert.equal(module.namespace.answer, 42);
+      })().catch(error => { console.error(error); process.exitCode = 1; });
     }
   `], { encoding: 'utf8' });
   assert.equal(result.status, 0, result.stderr);
@@ -569,6 +589,55 @@ for (const [name, target, role = 'symlink'] of [
     const result = bash(f, 'RUNTIME=runtime; declare -a output=(); build_opencode_mounts output missing_alias');
     assert.notEqual(result.status, 0);
     assert.ok(result.stderr.includes(`Missing OpenCode dependency: ${target}`), result.stderr);
+  });
+}
+
+for (const form of ['terminal', 'package ancestor', 'package-subdir ancestor']) {
+  test(`final alias fix preserves external ${form} destinations targeting approved config`, t => {
+    const f = fixture(t);
+    const canonical = path.join(f.home, 'configs/opencode');
+    const pkg = path.join(canonical, 'real'); fs.mkdirSync(path.join(pkg, 'dist'), { recursive: true });
+    const config = path.join(f.home, '.config/opencode'); fs.mkdirSync(path.dirname(config)); fs.symlinkSync(canonical, config);
+    const alias = '/home/agent/.config/opencode';
+    const external = path.join(f.home, 'links'); fs.mkdirSync(external);
+    const sibling = path.join(external, 'unrelated'); fs.mkdirSync(sibling);
+    fs.writeFileSync(path.join(external, 'package.json'), '{"name":"unrelated-ancestor"}');
+    fs.writeFileSync(path.join(pkg, 'package.json'), '{"name":"selected","type":"module"}');
+    const terminal = form === 'terminal';
+    const pluginCode = terminal ? 'export const answer = 42;' : "import { value } from './helper.mjs'; export const answer = value + 1;";
+    fs.writeFileSync(path.join(pkg, 'dist/plugin.mjs'), pluginCode);
+    fs.writeFileSync(path.join(pkg, 'dist/helper.mjs'), 'export const value = 41;');
+    fs.writeFileSync(path.join(pkg, 'token'), 'CREDENTIAL_FIXTURE_NEVER_PRINT');
+    let entry, lexicalRoot, sourceRoot;
+    if (terminal) {
+      entry = path.join(external, 'entry.mjs');
+      fs.symlinkSync(`${alias}/real/dist/plugin.mjs`, entry);
+    } else {
+      lexicalRoot = path.join(external, 'linked');
+      const subdir = form === 'package-subdir ancestor';
+      sourceRoot = subdir ? path.join(pkg, 'dist') : pkg;
+      fs.symlinkSync(`${alias}/real${subdir ? '/dist' : ''}`, lexicalRoot);
+      entry = path.join(lexicalRoot, subdir ? 'plugin.mjs' : 'dist/plugin.mjs');
+    }
+    assert.equal(fs.existsSync(entry), false, 'fixture must be physically dangling on the host');
+    fs.writeFileSync(path.join(canonical, 'cli.json'), JSON.stringify({ plugins: [entry] }));
+    fs.writeFileSync(path.join(canonical, 'opencode.json'), JSON.stringify({ reference: `{file:${alias}/real/token}` }));
+    useRealDependencyHelper(f, true);
+    const result = bash(f, 'RUNTIME=runtime; declare -a output=(); build_opencode_mounts output external_alias; printf "%s\\n" "${output[@]}"');
+    assert.equal(result.status, 0, result.stderr);
+    const files = [[entry, pluginCode]];
+    if (terminal) {
+      assert.ok(result.stdout.includes(`${pkg}/dist/plugin.mjs:${entry}:ro`), result.stdout);
+    } else {
+      files.push([path.join(path.dirname(entry), 'helper.mjs'), 'export const value = 41;']);
+      assert.ok(result.stdout.includes(`${sourceRoot}:${lexicalRoot}:ro`), result.stdout);
+      if (form === 'package ancestor') files.push([path.join(lexicalRoot, 'package.json'), '{"name":"selected","type":"module"}']);
+    }
+    for (const destination of [config, canonical, alias]) {
+      assert.ok(result.stdout.includes(`${pkg}/token:${destination}/real/token:ro`), result.stdout);
+    }
+    assertMountVisibleFiles(result.stdout, files, [f.home, '/home/agent', external, sibling, path.dirname(canonical)], entry);
+    assert.doesNotMatch(result.stdout + result.stderr, /CREDENTIAL_FIXTURE_NEVER_PRINT/);
   });
 }
 
