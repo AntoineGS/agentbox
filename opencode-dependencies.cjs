@@ -160,8 +160,9 @@ function walkDirectory(root, emit, visitedDirectories) {
   for (const entry of entries) {
     const name = validateAbsolutePath(path.join(root, entry.name));
     if (entry.isSymbolicLink()) {
-      collectLinkChain(name, emit);
-    } else if (entry.isDirectory() && !['.git', 'node_modules', '.cache'].includes(entry.name)) {
+      const pluginEntry = /\/(?:plugins|plugin)\/[^/]+\.[cm]?[jt]s$/.test(name);
+      collectLinkChain(name, record => emit(pluginEntry ? { ...record, role: 'plugin' } : record));
+    } else if (entry.isDirectory() && !['.git', '.cache'].includes(entry.name)) {
       walkDirectory(name, emit, visitedDirectories);
     }
   }

@@ -28,7 +28,6 @@ readonly CONTAINER_PREFIX="agentbox"
 
 # Set by check_runtime() in main()
 RUNTIME=""
-OPENCODE_BASE_MOUNTS=()
 OPENCODE_WRITABLE_SOURCES=()
 OPENCODE_WRITABLE_DESTINATIONS=()
 
@@ -416,9 +415,8 @@ build_mount_opts() {
     )
 
     if [[ "$tool" == "opencode" ]]; then
-        OPENCODE_BASE_MOUNTS=("$mount_dir" "$PROJECT_DIR" "${dirs_ref[@]}")
         local -a opencode_mounts=()
-        build_opencode_mounts opencode_mounts "$project_id" || return 1
+        build_opencode_mounts opencode_mounts "$project_id" "$1" || return 1
         mounts_ref+=("${opencode_mounts[@]}")
         local -a herdr_args=()
         build_herdr_args herdr_args || return 1
@@ -534,6 +532,7 @@ append_opencode_mount() {
     fi
     registry_ref["$destination"]="$signature"
     output_ref+=(-v "$source:$destination:$mode")
+    if [[ "$mode" == rw ]]; then track_opencode_writable_root "$2" "$destination" || return 1; fi
 }
 
 is_path_within() {
@@ -663,6 +662,17 @@ build_opencode_mounts() {
     mount_output=()
     OPENCODE_WRITABLE_SOURCES=()
     OPENCODE_WRITABLE_DESTINATIONS=()
+    if [[ -n "${3:-}" ]]; then
+        local -n existing_mounts="$3"
+        local index mount_source mount_destination mount_mode
+        for ((index = 0; index < ${#existing_mounts[@]}; index++)); do
+            [[ "${existing_mounts[index]}" == -v ]] || continue
+            index=$((index + 1))
+            IFS=: read -r mount_source mount_destination mount_mode <<< "${existing_mounts[index]}"
+            [[ "$mount_mode" == ro ]] && continue
+            track_opencode_writable_root "$mount_source" "$mount_destination" || return 1
+        done
+    fi
     local cache_parent="$HOME/.cache/agentbox/$project_id"
     local cache_dir="$cache_parent/opencode"
     mkdir -p -- "$HOME/.config/opencode" "$HOME/.local/share/opencode" "$cache_dir" || return 1
@@ -680,16 +690,6 @@ build_opencode_mounts() {
     append_opencode_mount "$output_name" "$data_real" "$data_real" rw registry || return 1
     append_opencode_mount "$output_name" "$data" /home/agent/.local/share/opencode rw registry || return 1
     append_opencode_mount "$output_name" "$cache_dir" /home/agent/.cache/opencode rw registry || return 1
-    track_opencode_writable_root "$config" "$config" || return 1
-    track_opencode_writable_root "$config_real" "$config_real" || return 1
-    track_opencode_writable_root "$config" /home/agent/.config/opencode || return 1
-    track_opencode_writable_root "$data" "$data" || return 1
-    track_opencode_writable_root "$data_real" "$data_real" || return 1
-    track_opencode_writable_root "$data" /home/agent/.local/share/opencode || return 1
-    track_opencode_writable_root "$cache_dir" /home/agent/.cache/opencode || return 1
-    for candidate in "${OPENCODE_BASE_MOUNTS[@]}"; do
-        track_opencode_writable_root "$candidate" "$candidate" || return 1
-    done
     for candidate in "$HOME/.claude/skills" "$HOME/.agents/skills"; do
         if [[ -d "$candidate" ]]; then
             local skills_real
@@ -726,14 +726,18 @@ build_opencode_mounts() {
         for config_file in "$ancestor/opencode.json" "$ancestor/opencode.jsonc" "$ancestor/.opencode/opencode.json" "$ancestor/.opencode/opencode.jsonc"; do
             if [[ -f "$config_file" || -L "$config_file" ]]; then
                 project_config_files+=("$config_file")
+                append_opencode_mount probe_mounts "$config_file" "$config_file" ro probe_registry || return 1
                 if [[ -L "$config_file" ]]; then
                     local link_path="$config_file" link_target link_value
+                    local -A config_link_seen=()
                     while [[ -L "$link_path" ]]; do
+                        [[ -n "${config_link_seen[$link_path]+present}" ]] && break
+                        config_link_seen["$link_path"]=1
                         link_value=$(readlink -- "$link_path") || { log_error "Cannot inspect OpenCode dependency: $link_path"; return 1; }
                         if [[ "$link_value" == /* ]]; then
-                            link_target=$(realpath -m -- "$link_value") || return 1
+                            link_target=$(realpath -ms -- "$link_value") || return 1
                         else
-                            link_target=$(realpath -m -- "$(dirname -- "$link_path")/$link_value") || return 1
+                            link_target=$(realpath -ms -- "$(dirname -- "$link_path")/$link_value") || return 1
                         fi
                         if [[ "$link_target" == *:* || "$link_target" == *$'\t'* || "$link_target" == *$'\r'* || "$link_target" == *$'\n'* ]]; then
                             log_error "Unsupported OpenCode mount path or mode."
@@ -748,8 +752,6 @@ build_opencode_mounts() {
                         fi
                         link_path="$link_target"
                     done
-                else
-                    append_opencode_mount probe_mounts "$config_file" "$config_file" ro probe_registry || return 1
                 fi
             fi
         done
@@ -803,9 +805,22 @@ build_opencode_mounts() {
                 return 1
             fi
             if [[ "$record_role" == plugin && -f "$dependency" ]]; then
-                local package_root
+                local package_root plugin_entry="$dependency"
+                if [[ -L "$plugin_entry" ]]; then
+                    all_records["$plugin_entry"]='ro:symlink:1'
+                    if [[ -z "${probe_registry[$plugin_entry]+present}" ]]; then
+                        append_opencode_mount probe_mounts "$plugin_entry" "$plugin_entry" ro probe_registry || return 1
+                        scan_args+=(--scan "$plugin_entry")
+                        changed=true
+                    fi
+                fi
+                dependency=$(realpath -e -- "$plugin_entry") || return 1
                 find_opencode_package_root package_root "$dependency" || return 1
-                if [[ -n "$package_root" ]]; then dependency="$package_root"; fi
+                if [[ -n "$package_root" ]]; then
+                    dependency="$package_root"
+                else
+                    dependency=${dependency%/*}
+                fi
                 record_role=plugin
                 record_mode=ro
             fi
@@ -861,16 +876,11 @@ build_opencode_mounts() {
             canonical_root=$(realpath -e -- "$dependency") || return 1
             if [[ "$canonical_root" != "$dependency" ]]; then
                 append_opencode_mount "$output_name" "$dependency" "$canonical_root" "$mode" registry || return 1
-                if [[ "$mode" == rw ]]; then track_opencode_writable_root "$dependency" "$canonical_root" || return 1; fi
             fi
-            if [[ "$mode" == rw ]]; then track_opencode_writable_root "$dependency" "$dependency" || return 1; fi
             if [[ "$dependency" == "$meridian_config" ||
                 ( -n "$meridian_config_real" && "$dependency" == "$meridian_config_real" ) ]]; then
                 append_opencode_mount "$output_name" "$dependency" \
                     /home/agent/.config/meridian "$mode" registry || return 1
-                if [[ "$mode" == rw ]]; then
-                    track_opencode_writable_root "$dependency" /home/agent/.config/meridian || return 1
-                fi
             fi
         fi
     done < <(printf '%s\n' "${ordered[@]}" | LC_ALL=C sort)

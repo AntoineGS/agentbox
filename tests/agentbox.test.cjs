@@ -25,7 +25,8 @@ function fixture(t) {
 
 function bash(f, body, args = []) {
   return spawnSync('bash', ['--noprofile', '--norc', '-c',
-    'set -euo pipefail; source "$1/agentbox"; shift; ' + body,
+    'set -euo pipefail; source "$1/agentbox"; shift; ' +
+    'dirname() { if [[ "${@: -1}" == "$HOME" ]]; then printf "/\\n"; else command dirname "$@"; fi; }; ' + body,
     'agentbox-test', repo, ...args], {
     cwd: f.projectDir,
     env: { ...process.env, HOME: f.home, PATH: `${f.bin}:${process.env.PATH}` },
@@ -33,13 +34,33 @@ function bash(f, body, args = []) {
   });
 }
 
-function useRealDependencyHelper(f) {
+function useRealDependencyHelper(f, mountVisible = false) {
   const helper = path.join(repo, 'opencode-dependencies.cjs');
   const runtime = `#!/usr/bin/env node
 const { spawnSync } = require('node:child_process');
 const helper = ${JSON.stringify(helper)};
 const marker = process.argv.indexOf('agentbox-discovery');
 if (marker < 0) process.exit(97);
+if (${mountVisible}) {
+  const { discover } = require(helper);
+  const mounts = [];
+  for (let i = 2; i < marker; i++) {
+    if (process.argv[i] === '-v') {
+      const [source, destination] = process.argv[++i].split(':');
+      mounts.push({ source, destination });
+    }
+  }
+  require(${JSON.stringify(path.join(repo, 'tests/probe-visible-fs.cjs'))})(mounts);
+  const { values } = require('node:util').parseArgs({ args: process.argv.slice(marker + 1), options: {
+    home: { type: 'string' }, config: { type: 'string' }, project: { type: 'string' },
+    scan: { type: 'string', multiple: true },
+  } });
+  for (const r of discover({ home: values.home, configDir: values.config,
+    projectDir: values.project, scanRoots: values.scan })) {
+    process.stdout.write([r.mode, r.role, Number(r.required), r.path].join('\\t') + '\\n');
+  }
+  process.exit(0);
+}
 const result = spawnSync(process.execPath, [helper, ...process.argv.slice(marker + 1)], {
   env: process.env, encoding: 'utf8',
 });
@@ -429,6 +450,100 @@ test('real helper closure mounts nested plugin package and multilevel external l
   assert.ok(result.stdout.includes(`${externalPlugin}:${externalPlugin}:ro`));
   assert.ok(!result.stdout.includes(`${siblingRepo}:${siblingRepo}:`));
   assert.ok(!result.stdout.includes(`${externalSibling}:${externalSibling}:`));
+});
+
+test('fix wave I1 mount-visible project and ancestor documents retain lexical declarations and link aliases', t => {
+  const f = fixture(t);
+  const external = path.join(f.home, 'external'); fs.mkdirSync(external);
+  const plugins = [path.join(f.projectDir, 'chosen'), path.join(f.home, 'ancestor-chosen')];
+  plugins.forEach(p => fs.mkdirSync(p));
+  for (const [index, defining] of [path.join(f.projectDir, 'opencode.json'), path.join(f.home, 'opencode.json')].entries()) {
+    const settings = path.join(external, `settings-${index}.json`);
+    const middle = path.join(external, `middle-${index}.json`);
+    fs.writeFileSync(settings, JSON.stringify({ plugins: [index ? './ancestor-chosen' : './chosen'] }));
+    fs.symlinkSync(settings, middle); fs.symlinkSync(middle, defining);
+  }
+  useRealDependencyHelper(f, true);
+  const result = bash(f, 'RUNTIME=runtime; declare -a output=(); build_opencode_mounts output visible; printf "%s\\n" "${output[@]}"');
+  assert.equal(result.status, 0, result.stderr);
+  for (const p of plugins) assert.ok(result.stdout.includes(`${p}:${p}:ro`), result.stdout);
+  for (const index of [0, 1]) assert.ok(result.stdout.includes(`${external}/settings-${index}.json:${external}/middle-${index}.json:ro`));
+  assert.ok(!result.stdout.includes(`${f.home}:${f.home}:`));
+  assert.ok(!result.stdout.includes(`${external}:${external}:`));
+});
+
+test('fix wave I2 standalone explicit and auto-discovered plugin entries include adjacent modules selectively', t => {
+  const f = fixture(t);
+  const config = path.join(f.home, '.config/opencode'); fs.mkdirSync(path.join(config, 'plugins'), { recursive: true });
+  const parents = ['explicit', 'automatic'].map(name => path.join(f.home, 'code', name));
+  for (const parent of parents) {
+    fs.mkdirSync(parent, { recursive: true });
+    fs.writeFileSync(path.join(parent, 'plugin.js'), "import './helper.js'; throw new Error('NEVER_EXECUTE');");
+    fs.writeFileSync(path.join(parent, 'helper.js'), 'adjacent fixture');
+  }
+  fs.mkdirSync(path.join(f.home, 'code/unrelated'));
+  fs.writeFileSync(path.join(config, 'opencode.json'), JSON.stringify({ plugins: [path.join(parents[0], 'plugin.js')] }));
+  fs.symlinkSync(path.join(parents[1], 'plugin.js'), path.join(config, 'plugins/automatic.js'));
+  useRealDependencyHelper(f, true);
+  const result = bash(f, 'RUNTIME=runtime; declare -a output=(); build_opencode_mounts output adjacent; printf "%s\\n" "${output[@]}"');
+  assert.equal(result.status, 0, result.stderr);
+  for (const parent of parents) assert.ok(result.stdout.includes(`${parent}:${parent}:ro`), result.stdout);
+  assert.ok(!result.stdout.includes(`${f.home}/code:${f.home}/code:`));
+  assert.doesNotMatch(result.stdout + result.stderr, /NEVER_EXECUTE/);
+});
+
+test('fix wave I2 multihop automatic plugin file aliases do not expand intermediate ancestors', t => {
+  const f = fixture(t);
+  const config = path.join(f.home, '.config/opencode'); fs.mkdirSync(path.join(config, 'plugins'), { recursive: true });
+  const selected = path.join(f.home, 'code/selected'); fs.mkdirSync(selected, { recursive: true });
+  const entry = path.join(selected, 'plugin.js'); fs.writeFileSync(entry, "import './helper.js';");
+  fs.writeFileSync(path.join(selected, 'helper.js'), 'fixture');
+  const middle = path.join(f.home, 'middle.js'); fs.symlinkSync(entry, middle);
+  fs.symlinkSync(middle, path.join(config, 'plugins/automatic.js'));
+  useRealDependencyHelper(f, true);
+  const result = bash(f, 'RUNTIME=runtime; declare -a output=(); build_opencode_mounts output chain; printf "%s\\n" "${output[@]}"');
+  assert.equal(result.status, 0, result.stderr);
+  assert.ok(result.stdout.includes(`${selected}:${selected}:ro`), result.stdout);
+  assert.ok(result.stdout.includes(`${entry}:${middle}:ro`), result.stdout);
+  assert.ok(!result.stdout.includes(`${f.home}:${f.home}:`));
+});
+
+test('fix wave I3 regular node_modules linked dependency trees close without unrelated workspaces', t => {
+  const f = fixture(t);
+  const config = path.join(f.home, '.config/opencode'); fs.mkdirSync(config, { recursive: true });
+  const pkg = path.join(f.home, 'package');
+  const linked = path.join(f.home, 'workspace/linked');
+  const nested = path.join(f.home, 'workspace/nested');
+  for (const p of [pkg, linked, nested]) fs.mkdirSync(path.join(p, 'node_modules/@scope'), { recursive: true });
+  fs.mkdirSync(path.join(f.home, 'workspace/unrelated'));
+  fs.symlinkSync(linked, path.join(pkg, 'node_modules/@scope/linked'));
+  fs.symlinkSync(nested, path.join(linked, 'node_modules/nested'));
+  fs.symlinkSync(pkg, path.join(nested, 'node_modules/cycle'));
+  fs.writeFileSync(path.join(config, 'opencode.json'), JSON.stringify({ plugins: [pkg] }));
+  useRealDependencyHelper(f, true);
+  const result = bash(f, 'RUNTIME=runtime; declare -a output=(); build_opencode_mounts output linked; printf "%s\\n" "${output[@]}"');
+  assert.equal(result.status, 0, result.stderr);
+  for (const p of [linked, nested]) assert.ok(result.stdout.includes(`${p}:${p}:ro`), result.stdout);
+  assert.ok(!result.stdout.includes(`${f.home}/workspace:${f.home}/workspace:`));
+});
+
+test('fix wave I4 full writable inventory protects package caches history project and additional aliases', t => {
+  const f = fixture(t);
+  const config = path.join(f.home, '.config/opencode'); fs.mkdirSync(config, { recursive: true });
+  const extra = path.join(f.home, 'extra'); fs.mkdirSync(extra);
+  const pairs = ['npm', 'pip', 'maven', 'gradle'].map((name, i) => [
+    path.join(f.home, '.cache/agentbox/inventory', name),
+    ['/home/agent/.npm', '/home/agent/.cache/pip', '/home/agent/.m2', '/home/agent/.gradle'][i],
+  ]);
+  pairs.push([path.join(f.home, '.agentbox/projects/inventory/history'), '/home/agent/.shell_history'],
+    [f.projectDir, f.projectDir], [extra, extra]);
+  for (const [source] of pairs) { fs.mkdirSync(source, { recursive: true }); fs.writeFileSync(path.join(source, 'referenced'), 'PRIVATE_FIXTURE'); }
+  fs.writeFileSync(path.join(config, 'opencode.json'), JSON.stringify({ refs: pairs.map(([p]) => `{file:${p}/referenced}`) }));
+  useRealDependencyHelper(f, true);
+  const result = bash(f, 'RUNTIME=runtime; declare -a output=() dirs=("$1"); build_mount_opts output inventory opencode dirs "$PROJECT_DIR"; printf "%s\\n" "${output[@]}"', [extra]);
+  assert.equal(result.status, 0, result.stderr);
+  for (const [source, destination] of pairs) assert.ok(result.stdout.includes(`${source}/referenced:${destination}/referenced:ro`), result.stdout);
+  assert.doesNotMatch(result.stdout + result.stderr, /PRIVATE_FIXTURE/);
 });
 
 test('failed probe restores the caller RETURN trap and removes its private temp directory', t => {
