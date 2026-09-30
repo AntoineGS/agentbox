@@ -7,17 +7,20 @@ const { spawn, spawnSync } = require('node:child_process');
 const repo = path.resolve(__dirname, '..');
 
 function fixture(t) {
-  fs.mkdirSync('/tmp/opencode', { recursive: true });
-  const home = fs.mkdtempSync('/tmp/opencode/agentbox-test-');
+  const fixtureRoot = process.env.AGENTBOX_TEST_TMPDIR || '/tmp/opencode';
+  fs.mkdirSync(fixtureRoot, { recursive: true });
+  const home = fs.mkdtempSync(path.join(fixtureRoot, 'agentbox-test-'));
+  const tmpdir = path.join(home, 'tmp');
   const bin = path.join(home, 'bin');
   const projectDir = path.join(home, 'project');
+  fs.mkdirSync(tmpdir);
   fs.mkdirSync(bin);
   fs.mkdirSync(projectDir);
   for (const runtime of ['docker', 'podman']) {
     fs.writeFileSync(path.join(bin, runtime), '#!/bin/sh\nexit 1\n', { mode: 0o755 });
   }
   t.after(() => fs.rmSync(home, { recursive: true, force: true }));
-  return { home, bin, projectDir };
+  return { home, bin, projectDir, tmpdir };
 }
 
 function bash(f, body, args = []) {
@@ -51,40 +54,63 @@ function smokeEnvironment(f, record, overrides = {}) {
   const env = { ...process.env, HOME: f.home, PATH: `${f.bin}:${process.env.PATH}`,
     TOOL: 'opencode', AGENTBOX_OPENCODE_VERSION: '2', RECORD: record,
     OPENCODE_CONFIG_DIR: `${f.home}/.config/opencode`,
-    XDG_STATE_HOME: `${f.home}/.local/state` };
+    XDG_STATE_HOME: `${f.home}/.local/state`, TMPDIR: f.tmpdir };
   delete env.OPENCODE_PASSWORD;
   delete env.OPENCODE_SERVER_PASSWORD;
+  for (const name of ['HERDR_ENV', 'HERDR_SOCKET_PATH', 'HERDR_PANE_ID', 'HERDR_TAB_ID', 'HERDR_WORKSPACE_ID']) {
+    delete env[name];
+  }
   return { ...env, ...overrides };
 }
 
-function writeSmokeOpenCode(f, { version = '2.0.19', plugins, mcps, failEndpoint } = {}) {
+function writeSmokeOpenCode(f, { version = '2.0.19', plugins, agents, skills, commands,
+  mcps, delayedCatalogs = {}, catalogLocation, requirePrivatePassword = false,
+  apiErrorEndpoint, failEndpoint } = {}) {
   const record = path.join(f.home, 'smoke-calls.jsonl');
   const pluginCatalog = plugins ?? { data: [{ id: 'fixture-plugin',
     source: { path: '/fixture/plugins/source-plugin', target: '/fixture/plugins/source-plugin' },
     state: { status: 'active' }, description: 'CATALOG_CONTENT_FIXTURE' }] };
+  const agentCatalog = agents ?? { data: [] };
+  const skillCatalog = skills ?? { data: [] };
+  const commandCatalog = commands ?? { data: [] };
   const mcpCatalog = mcps ?? { data: [
     { name: 'connected-fixture', status: { status: 'connected' } },
     { name: 'disabled-fixture', status: { status: 'disabled', error: 'MCP_ERROR_FIXTURE' } },
   ] };
   const program = `#!/usr/bin/env node
 const fs = require('node:fs');
+const http = require('node:http');
 const args = process.argv.slice(2);
-fs.appendFileSync(process.env.RECORD, JSON.stringify({ args,
+fs.appendFileSync(process.env.RECORD, JSON.stringify({ args, pid: process.pid,
   passwordPresent: Boolean(process.env.OPENCODE_PASSWORD),
   legacyPasswordPresent: Object.hasOwn(process.env, 'OPENCODE_SERVER_PASSWORD') }) + '\\n');
 if (args[0] === '--version') { process.stdout.write('opencode v${version}\\n'); process.exit(0); }
 if (args[0] === 'serve') {
-  process.stdout.write('server listening on http://127.0.0.1:49123\\n');
-  process.on('SIGTERM', () => process.exit(0));
-  setInterval(() => {}, 1000);
-} else if (args[0] === 'api') {
-  const endpoint = args[args.length - 1];
-  if (endpoint === ${JSON.stringify(failEndpoint ?? '')}) {
-    process.stderr.write('PRIVATE_API_ERROR_FIXTURE\\n'); process.exit(17);
-  }
-  const catalogs = { '/api/plugin': ${JSON.stringify(pluginCatalog)}, '/api/mcp': ${JSON.stringify(mcpCatalog)} };
-  const response = catalogs[endpoint] ?? { data: [] };
-  process.stdout.write(JSON.stringify(response));
+  const startedAt = Date.now();
+  const catalogs = { '/api/plugin': ${JSON.stringify(pluginCatalog)}, '/api/agent': ${JSON.stringify(agentCatalog)},
+    '/api/skill': ${JSON.stringify(skillCatalog)}, '/api/command': ${JSON.stringify(commandCatalog)},
+    '/api/mcp': ${JSON.stringify(mcpCatalog)} };
+  const server = http.createServer((request, response) => {
+    const endpoint = request.url;
+    const authenticated = request.headers.authorization === 'Basic ' +
+      Buffer.from('opencode:' + (process.env.OPENCODE_PASSWORD ?? '')).toString('base64');
+    fs.appendFileSync(process.env.RECORD, JSON.stringify({ args: ['http', request.method, endpoint],
+      pid: process.pid, authenticated, legacyPasswordPresent: Object.hasOwn(process.env, 'OPENCODE_SERVER_PASSWORD') }) + '\\n');
+    if (${requirePrivatePassword} && !authenticated) {
+      response.writeHead(401); response.end('PRIVATE_API_ERROR_FIXTURE'); return;
+    }
+    if (endpoint === ${JSON.stringify(failEndpoint ?? '')}) {
+      response.writeHead(500); response.end('PRIVATE_API_ERROR_FIXTURE'); return;
+    }
+    let body = catalogs[endpoint] ?? { data: [] };
+    const delayMs = (${JSON.stringify(delayedCatalogs)})[endpoint] ?? 0;
+    if (Date.now() - startedAt < delayMs) body = { data: [] };
+    if (endpoint !== '/api/info') body = { location: { directory: ${JSON.stringify(catalogLocation ?? null)} ?? process.cwd() }, ...body };
+    if (endpoint === ${JSON.stringify(apiErrorEndpoint ?? '')}) body = { error: { name: 'Forbidden', message: 'SENSITIVE_API_ERROR_FIXTURE' } };
+    response.writeHead(200, { 'content-type': 'application/json' }); response.end(JSON.stringify(body));
+  });
+  server.listen(0, '127.0.0.1', () => process.stdout.write('server listening on http://127.0.0.1:' + server.address().port + '\\n'));
+  process.on('SIGTERM', () => { server.closeAllConnections(); server.close(() => process.exit(0)); });
 } else { process.exit(99); }
 `;
   fs.writeFileSync(path.join(f.bin, 'opencode'), program, { mode: 0o755 });
@@ -170,7 +196,7 @@ test('mount registry deduplicates equal mounts and rejects conflicting modes', t
     'declare -a output=(); declare -A seen=(); append_opencode_mount output "$1" /fixture ro seen; ' +
     'append_opencode_mount output "$1" /fixture ro seen; printf "%s\\n" "${output[@]}"', [dir]);
   assert.equal(same.status, 0, same.stderr);
-  assert.equal((same.stdout.match(/-v/g) || []).length, 1);
+  assert.equal(same.stdout.trim().split('\n').filter(argument => argument === '-v').length, 1);
   const conflict = bash(f,
     'declare -a output=(); declare -A seen=(); append_opencode_mount output "$1" /fixture ro seen; ' +
     'append_opencode_mount output "$1" /fixture rw seen', [dir]);
@@ -217,7 +243,7 @@ test('Herdr forwards only allowlisted context and mounts socket aliases alone', 
   fs.mkdirSync(real); fs.symlinkSync(real, alias);
   const actual = path.join(real, 'herdr.sock'); const advertised = path.join(alias, 'herdr.sock');
   const server = require('node:net').createServer();
-  await new Promise(resolve => server.listen(actual, resolve));
+  await new Promise(resolve => server.listen(path.relative(process.cwd(), actual), resolve));
   t.after(() => new Promise(resolve => server.close(resolve)));
   const result = bash(f,
     'export HERDR_ENV=1 HERDR_SOCKET_PATH="$1" HERDR_PANE_ID=pane HERDR_TAB_ID=tab ' +
@@ -676,7 +702,7 @@ test('smoke checks all read-only APIs and requested plugin, MCP, Meridian, and p
   const f = fixture(t);
   const record = writeSmokeOpenCode(f, { plugins: { data: [
     { id: 'fixture-plugin', source: { path: '/fixture/plugins/source-plugin' }, state: { status: 'active' } },
-  ] } });
+  ] }, requirePrivatePassword: true });
   const timeoutRecord = path.join(f.home, 'timeout-values');
   fs.writeFileSync(path.join(f.bin, 'timeout'),
     '#!/bin/sh\nprintf "%s\\n" "$1" >> "$TIMEOUT_RECORD"\nshift\nexec "$@"\n',
@@ -714,16 +740,98 @@ test('smoke checks all read-only APIs and requested plugin, MCP, Meridian, and p
     /CATALOG_CONTENT_FIXTURE|MCP_ERROR_FIXTURE|OLD_PASSWORD_FIXTURE|LEGACY_PASSWORD_FIXTURE/);
   const calls = smokeCalls(record);
   assert.equal(calls.filter(call => call.args[0] === 'serve').length, 1);
-  assert.equal(calls.filter(call => call.args[0] === 'api').length, 7);
+  const apiCalls = calls.filter(call => call.args[0] === 'http');
   assert.ok(fs.readFileSync(timeoutRecord, 'utf8').trim().split('\n')
     .every(value => Number.parseInt(value, 10) >= 60), 'API timeout should honor the 120-second deadline');
-  assert.deepEqual(calls.filter(call => call.args[0] === 'api').map(call => call.args.at(-1)).sort(),
-    ['/api/agent', '/api/command', '/api/info', '/api/mcp', '/api/model', '/api/plugin', '/api/skill']);
-  assert.ok(calls.filter(call => call.args[0] === 'api').every(call =>
-    call.args.includes('--server') && call.args.includes('http://127.0.0.1:49123') && call.args.includes('get')));
+  const refreshCount = apiCalls.filter(call => call.args.at(-1) === '/api/plugin').length;
+  assert.ok(refreshCount >= 2, 'catalogs should be refreshed after bounded startup readiness');
+  for (const endpoint of ['/api/agent', '/api/command', '/api/mcp', '/api/model', '/api/plugin', '/api/skill']) {
+    assert.equal(apiCalls.filter(call => call.args.at(-1) === endpoint).length, refreshCount,
+      `${endpoint} must be refreshed together with the final snapshot`);
+  }
+  assert.equal(apiCalls.filter(call => call.args.at(-1) === '/api/info').length, 1);
+  assert.ok(apiCalls.every(call => call.args[1] === 'GET'));
   const serveCall = calls.find(call => call.args[0] === 'serve');
   assert.equal(serveCall.passwordPresent, true);
   assert.equal(serveCall.legacyPasswordPresent, false);
+  assert.ok(apiCalls.every(call => call.authenticated && !call.legacyPasswordPresent),
+    'the fixture API server requires the private password on its requests');
+  assert.deepEqual(fs.readdirSync(path.join(f.tmpdir, 'opencode')), [],
+    'successful smoke cleanup removes its private workspace');
+  assert.throws(() => process.kill(serveCall.pid, 0), { code: 'ESRCH' },
+    'successful smoke cleanup stops its owned private server');
+});
+
+test('smoke waits for delayed configured catalogs and reports refreshed counts', async t => {
+  const f = fixture(t);
+  const record = writeSmokeOpenCode(f, {
+    plugins: { data: [{ id: 'delayed-plugin', source: { path: '/fixture/delayed-plugin' },
+      state: { status: 'active' } }] },
+    agents: { data: [{ id: 'delayed-agent', name: 'Delayed agent' }] },
+    skills: { data: [{ id: 'delayed-skill', name: 'Delayed skill' }] },
+    commands: { data: [{ name: 'delayed-command' }] },
+    delayedCatalogs: {
+      '/api/plugin': 3500, '/api/agent': 3500, '/api/skill': 3500, '/api/command': 3500,
+    },
+  });
+  const result = await runSmokeAsync(f, ['--require-plugin', 'delayed-plugin',
+    '--require-agent', 'delayed-agent', '--require-skill', 'delayed-skill',
+    '--require-command', 'delayed-command'],
+    smokeEnvironment(f, record));
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  assert.match(result.stdout, /Verified API endpoint: plugin \(1 entries\)/);
+  assert.match(result.stdout, /Verified API endpoint: agent \(1 entries\)/);
+  assert.match(result.stdout, /Verified agent: delayed-agent \(present\)/);
+  assert.match(result.stdout, /Verified skill: delayed-skill \(present\)/);
+  assert.match(result.stdout, /Verified command: delayed-command \(present\)/);
+  assert.match(result.stdout, /Verified catalog location: /);
+  const calls = smokeCalls(record).filter(call => call.args[0] === 'http');
+  assert.ok(calls.filter(call => call.args.at(-1) === '/api/plugin').length > 2,
+    'plugin readiness must poll until its delayed activation');
+  assert.ok(calls.filter(call => call.args.at(-1) === '/api/agent').length > 1,
+    'agent catalog must be refreshed after delayed startup');
+  assert.ok(calls.filter(call => call.args.at(-1) === '/api/skill').length > 1,
+    'skill catalog must be refreshed after delayed startup');
+  assert.ok(calls.filter(call => call.args.at(-1) === '/api/command').length > 1,
+    'command catalog must be refreshed after delayed startup');
+});
+
+test('smoke accepts a configured plugin directory containing its loaded entrypoint', async t => {
+  const f = fixture(t);
+  const record = writeSmokeOpenCode(f, { plugins: { data: [
+    { id: 'directory-plugin', source: { path: '/fixture/plugins/source-plugin/index.js' },
+      state: { status: 'active' } },
+  ] } });
+  const refreshCount = path.join(f.home, 'plugin-refresh-count');
+  fs.writeFileSync(path.join(f.bin, 'timeout'), '#!/bin/sh\nshift\ncase "$*" in\n' +
+    '  *"/api/plugin")\n    count=0; [ ! -f ' + JSON.stringify(refreshCount) +
+    ' ] || count=$(cat ' + JSON.stringify(refreshCount) + ')\n' +
+    '    count=$((count + 1)); printf \'%s\' "$count" > ' + JSON.stringify(refreshCount) +
+    '\n    [ "$count" -le 2 ] || exit 124\n    ;;\nesac\nexec "$@"\n',
+    { mode: 0o755 });
+  const result = await runSmokeAsync(f, ['--require-plugin', '/fixture/plugins'],
+    smokeEnvironment(f, record));
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  assert.match(result.stdout, /Verified plugin: \/fixture\/plugins \(active\)/);
+});
+
+test('smoke rejects a catalog returned for a different project location', async t => {
+  const f = fixture(t);
+  const record = writeSmokeOpenCode(f, { catalogLocation: '/fixture/wrong-location' });
+  const result = await runSmokeAsync(f, [], smokeEnvironment(f, record));
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /API catalog location mismatch: \/api\/plugin/);
+  assert.doesNotMatch(result.stdout + result.stderr, /fixture\/wrong-location/);
+});
+
+test('smoke classifies API catalog errors without echoing their message', async t => {
+  const f = fixture(t);
+  const record = writeSmokeOpenCode(f, { apiErrorEndpoint: '/api/agent' });
+  const result = await runSmokeAsync(f, [], smokeEnvironment(f, record));
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr,
+    /Invalid API catalog response: \/api\/agent \(location: missing, data: null, API error: Forbidden\)/);
+  assert.doesNotMatch(result.stdout + result.stderr, /SENSITIVE_API_ERROR_FIXTURE/);
 });
 
 test('smoke reports API failure without echoing service stderr or response data', async t => {
@@ -731,7 +839,7 @@ test('smoke reports API failure without echoing service stderr or response data'
   const record = writeSmokeOpenCode(f, { failEndpoint: '/api/info' });
   const result = await runSmokeAsync(f, [], smokeEnvironment(f, record));
   assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /API request failed: \/api\/info \(exit status: 17\)/);
+  assert.match(result.stderr, /API request failed: \/api\/info \(exit status: 22\)/);
   assert.doesNotMatch(result.stdout + result.stderr, /PRIVATE_API_ERROR_FIXTURE/);
 });
 

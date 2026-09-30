@@ -6,8 +6,9 @@ const { spawnSync } = require('node:child_process');
 const { discover, collectConfig } = require('../opencode-dependencies.cjs');
 
 function tree(t) {
-  fs.mkdirSync('/tmp/opencode', { recursive: true });
-  const home = fs.mkdtempSync('/tmp/opencode/agentbox-discovery-');
+  const fixtureRoot = process.env.AGENTBOX_TEST_TMPDIR || '/tmp/opencode';
+  fs.mkdirSync(fixtureRoot, { recursive: true });
+  const home = fs.mkdtempSync(path.join(fixtureRoot, 'agentbox-discovery-'));
   const configDir = path.join(home, '.config/opencode');
   const projectDir = path.join(home, 'project');
   fs.mkdirSync(configDir, { recursive: true });

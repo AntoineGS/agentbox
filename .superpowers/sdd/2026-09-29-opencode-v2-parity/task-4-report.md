@@ -2,11 +2,11 @@
 
 ## Status
 
-**DONE_WITH_CONCERNS** — The smoke checker, documentation, fixture coverage, and safe container checks are complete. Full host parity is not established: the real server returned empty plugin and agent catalogs, the CLI-plugin load result was inconclusive, and there was no host OpenCode listener available for an identity comparison.
+**DONE_WITH_CONCERNS (implementation; controller re-review pending)** — Fix round 1 replaces cold catalog sampling with bounded readiness and final location-checked snapshots. The real container now verifies every enumerated server plugin and configured agent/skill/command definition, the requested MCP states, and Meridian's live catalog. Full host parity remains unestablished because renderer-only CLI-plugin success is inconclusive and the real `.env` selector fixture remains blocked by Safety Net.
 
 ## Changes
 
-- Added `tests/opencode-smoke.sh`, an opt-in, read-only check for the selected V2 version, seven API endpoints, optional plugin/MCP expectations, Meridian's model catalog, and connection-only Herdr socket access. It creates one private child server with a temporary password and reports catalog counts/statuses rather than bodies.
+- Added `tests/opencode-smoke.sh`, an opt-in, read-only check for the selected V2 version, seven API endpoints, optional plugin/agent/skill/command/MCP expectations, Meridian's model catalog, and connection-only Herdr socket access. It creates one private child server with a temporary password, waits for catalog readiness, validates the returned project location, and reports final counts/statuses rather than bodies.
 - Updated `README.md` and `DEVELOPMENT_NOTES.md` for selective mounts, shared config/data, isolated state/cache, host networking, private-server behavior, rebuild selection, and the smoke command.
 - Corrected managed API/run argument placement for OpenCode 2.0.19 and added the Meridian config home alias required by its discovered root dependency.
 - Fixed managed OpenCode launches being short-circuited when the noninteractive `zsh -c` source of `~/.zshrc` returns nonzero. A regression test covers the failure; Claude retains its original `&&` gate.
@@ -18,25 +18,82 @@
 - `bash -n agentbox entrypoint.sh tests/opencode-smoke.sh`, `node --check opencode-dependencies.cjs`, and `git diff --check`: passed.
 - `shellcheck agentbox entrypoint.sh tests/opencode-smoke.sh` exits 1 on the previously recorded baseline warnings (agentbox SC2155/SC2034; entrypoint SC1091/SC2166/SC2046). No new warning category was introduced.
 - The real Docker image build completed and selected OpenCode `2.0.19`.
-- Real private-server smoke: all seven endpoints responded; counts were plugin **0**, agent **0**, skill **2**, command **8**, model **44**, and MCP **9**. The extended check found all five configured InterBase MCPs connected, all four debugger MCPs disabled, a nonempty Meridian model catalog at `127.0.0.1:3456`, and a Herdr socket connection without an RPC request.
+- Pre-fix initial sample (superseded by Fix round 1 below): all seven endpoints responded, but plugin and agent counts were **0**; the sample was too early to be an integration verdict. The extended check at that time found five InterBase MCPs connected, four debugger MCPs disabled, a nonempty Meridian catalog, and a connection-only Herdr socket check.
 - The managed `agentbox --tool opencode api get /api/info` command returned version `2.0.19` and a container-local loopback URL after the zsh-return fix. The private child process was allowed to exit with its container.
-- A renderer-only TUI launch used a real PTY, fresh container-local `XDG_DATA_HOME`, `HERDR_ENV=0`, and no session/pane identifiers or input. Filtered debug output referenced both provider-indicator and Herdr load events, but also matched failure-pattern text for both; successful plugin activation is therefore **inconclusive**, not claimed. The bounded TUI process was terminated by its timeout.
+- An earlier renderer-only TUI launch used a real PTY, fresh container-local `XDG_DATA_HOME`, `HERDR_ENV=0`, and no session/pane identifiers or input. Its filtered logs were ambiguous; Fix round 1 repeats and narrows that check below.
 - Earlier actual-container inspection recorded host networking, the shared config/data aliases, the separate reusable AgentBox cache, the main-checkout mount, no host state mount, and readable Meridian code/config aliases. No AgentBox-driven config/auth replacement or conversion was observed. Live SQLite bytes were not compared.
 
 ## Outstanding checks and safety boundary
 
-- The private server's plugin and agent catalogs each returned zero entries. The required Meridian server plugin was consequently missing; configured server plugins/agents (Meridian, Jev, routing, Superpowers, and safety-net) are not verified. Meridian's HTTP model catalog working does not prove its OpenCode plugin loaded.
-- The host listener check found `127.0.0.1:3456` but no listener on the expected OpenCode port `4096`; host-service identity comparison is incomplete. No host service was started, stopped, or modified.
+- Server-plugin, configured-definition, and MCP parity are verified by the Fix round 1 checks below. The renderer-only provider-indicator/Herdr CLI activation result remains inconclusive and is not inferred from server catalogs.
+- A port-4096-only host check was incomplete. Fix round 1 scanned all host TCP listeners and found an existing OpenCode-owned loopback listener on port `49374`; process/state evidence below distinguishes it from the ephemeral managed container server. No host service was contacted, started, stopped, or modified.
 - A real `.env` selector-override fixture launch was blocked by Safety Net (`secret.basename.env`). It was not retried or worked around and remains incomplete.
-- No prompts, paid requests, session selection/resumption, Herdr pane RPC, config/credential inspection, or database repair was performed. Smoke/TUI runs excluded project `.env` injection.
+- No prompts, paid requests, session selection/resumption, Herdr pane RPC, credential-content reads, or database repair was performed. Plugin declarations and definition filenames were used as read-only expectations; selected config/cache metadata was checked without reading auth or credential files. Smoke/TUI runs excluded project `.env` injection.
 
-## Final fast-check output
+## Baseline verification (before fix round 1)
 
-- Unit tests: **62/62 passed**.
-- Syntax checks and whitespace check: passed.
-- ShellCheck: baseline diagnostics only; exit status 1 as recorded above.
+- Unit tests on the prior baseline: **62/62 passed**.
+- Baseline syntax/whitespace and ShellCheck results are superseded by the fresh fix-round verification below.
 
-## Final review
+## Review boundary
 
-- Jev selected full-branch review dimensions for architecture, security, database, performance, deployment, tests, documentation, and accessibility. No reviewer was delegated because the user required controller-owned review.
-- Controller self-review covered all five plan Review Focus items, the approved spec, the Task 4 implementation, and actual evidence. No additional Critical/Important code findings were identified; the known integration gaps are listed above. This was not an independent review.
+- This fix round had no delegated/nested reviewer and no broad review. The task implementer performed the self-review; controller-owned independent scoped re-review is pending. No approval is claimed.
+
+## Fix round 1/5: readiness, final evidence, and remaining blockers
+
+### Checker and regression changes
+
+- Added `--require-agent`, `--require-skill`, and `--require-command`. The checker waits through a three-second startup floor, polls every relevant catalog while required entries are pending, validates `.location.directory` against `pwd -P`, then refreshes all six catalogs and checks the final snapshot before reporting counts.
+- `--require-plugin` accepts an exact ID/source or a configured absolute plugin directory containing its loaded entrypoint; the Meridian directory requirement now matches the active `index.js` source.
+- Catalog GETs use authenticated read-only HTTP with a random password held in a mode-`0600` temporary curl config inside the owned private workspace. This avoids an observed OpenCode 2.0.19 `api get /api/skill` client-output defect while still checking the private server's API route. The smoke suppresses response bodies and raw service errors.
+- RED: the delayed-activation fixture reproduced stale output (`plugin (0 entries)`, `agent (0 entries)`) despite the requirement becoming active after the three-second delay. GREEN: the delayed plugin/agent/skill/command test passes and reports populated final counts. Additional fixtures cover path-location mismatch, sanitized API error classification, directory-source plugin matching, enforced temporary authentication, child termination, workspace cleanup, and refresh of all catalogs.
+
+### Real configured runtime checks
+
+- Actual configured-server command (run with `HERDR_ENV=0`):
+
+  ```bash
+  main_checkout=$(git worktree list --porcelain | sed -n '1s/^worktree //p')
+  cmd=(./agentbox --add-dir "$main_checkout" --tool opencode shell bash tests/opencode-smoke.sh \
+    --require-plugin /usr/lib/meridian/dist/meridian-v2 \
+    --require-plugin agent-provider-routing --require-plugin herdr.opencode \
+    --require-plugin jev --require-plugin tmux-agent-indicator \
+    --require-plugin superpowers --require-plugin cc-safety-net \
+    --require-mcp interbase_nrf01 --require-mcp interbase_reference \
+    --require-mcp interbase_centrale --require-mcp interbase_todos \
+    --require-mcp interbase_mdevapps \
+    --disabled-mcp rdbg_x64 --disabled-mcp rdbg_x86 \
+    --disabled-mcp rdbg_vm_x64 --disabled-mcp rdbg_vm_x86 \
+    --meridian-url http://127.0.0.1:3456/v1/models)
+  HERDR_ENV=0 script -qefc "$(printf '%q ' "${cmd[@]}")" /dev/null
+  ```
+
+  A second run built `args` from read-only file discovery and then invoked `bash tests/opencode-smoke.sh "${args[@]}"`; agent IDs came from `*.md` under configured `agents` roots, skill IDs from directories containing `SKILL.md`, and command IDs from configured `command(s)/*.md` roots. This required **47 agents, 39 skills, and 37 commands** in addition to the static plugin/MCP/Meridian options above. No definition bodies were printed.
+- Final private-server result: version `2.0.19`; all seven endpoints passed; every catalog reported the current working directory. Counts: plugin **94**, agent **54**, skill **57**, command **45**, model **44**, MCP **9**.
+- All seven configured server-plugin expectations were **active**: Meridian (`/usr/lib/meridian/dist/meridian-v2`), `agent-provider-routing`, `herdr.opencode`, `jev`, `tmux-agent-indicator`, `superpowers`, and `cc-safety-net`. File-backed definitions all passed presence requirements: **47 agents, 39 skills, 37 commands**. All five configured InterBase MCPs were **connected**, all four debugger MCPs were **disabled**, and Meridian returned a nonempty model catalog.
+- The managed `agentbox --tool opencode api get /api/info` route returned `2.0.19`, container API PID `621`, loopback URL `http://127.0.0.1:44985`, and temp path `/tmp/opencode`. After the AgentBox container exited, port `44985` was no longer listening.
+- An all-listener process-ownership scan found the pre-existing host OpenCode process at `127.0.0.1:49374`, PID `3053404`, executable `/usr/bin/opencode`, UID `155801123`, started Sep 29 2026 at 14:56:22. No request was sent to it. A separate private child observed inside AgentBox was PID `380`, command `opencode`, parent PID `8`, user `agent`, at loopback port `34095`; its state path resolved to the container overlay (`/`), while OpenCode shared data and AgentBox cache resolved to their explicit mount targets. This corrects the earlier assumption based on port `4096` alone.
+- Two separate AgentBox container launches saw identical device/inode/size/mtime metadata for the cached `superpowers` and `cc-safety-net` package directories. The second full smoke reused those entries without metadata changes. Metadata for the OpenCode config directory, present `opencode.json`/`opencode.jsonc`/`cli.json`, and Meridian `plugins.json` was unchanged between launches and across the second smoke. No credential values or auth-file contents were read or printed; configured plugin declarations were parsed read-only and only plugin identifiers/paths were emitted. No live SQLite bytes were read or hashed.
+- CLI-client diagnostic: `opencode api ... get /api/skill` returned **241,664 bytes of non-JSON**; a direct authenticated GET to the same private server returned HTTP **200** with the expected catalog envelope. The other six CLI API route outputs were JSON. No non-JSON content was printed or retained. The smoke now tests server routes over direct HTTP; the managed CLI `/api/info` route was separately verified.
+
+### Renderer-only CLI plugin result
+
+- Two bounded PTY launches used fresh container-local `XDG_DATA_HOME` under an owned temporary directory, `HERDR_ENV=0`, no session/pane identifiers, and no input. They timed out and were forcibly terminated as planned (status **137**); no host session was selected or resumed.
+- Sanitized trace summary: provider-indicator references **0**, rendered `Rte: OpenAI/Anthropic` marker **absent**; Herdr references **3**, load-like markers **1**, failure markers **0**. Module-resolution, permission, external-network, auth, and compatibility error-pattern counts were all **0**. The provider-indicator's data source has `orchestrator_provider=openai`, but no renderer marker appeared on the safe no-session screen. With `HERDR_ENV=0`, Herdr's session callbacks intentionally return before socket/RPC behavior.
+- Therefore provider-indicator and Herdr CLI-plugin **successful activation remains unverified**. The readable plugin mounts and absence of categorized load errors do not prove renderer registration; the no-session safety boundary prevented opening a session/prompt to force a footer render. This is an unresolved CLI/TUI integration result, not evidence of a server-plugin or catalog failure.
+
+### Fix-round verification and safety
+
+- Full fix-round suite (the owned worktree-local fixture root was removed by the trap):
+
+  ```bash
+  testtmp=$(mktemp -d "$PWD/.task4-test.XXXXXX")
+  trap 'rm -rf -- "$testtmp"' EXIT
+  AGENTBOX_TEST_TMPDIR="$testtmp" NODE_PATH=/tmp/opencode/agentbox-dev/node_modules node --test tests/*.test.cjs
+  ```
+
+  Result: **66 passed, 0 failed**. The test temp root avoided `/tmp` cleanup or unrelated files.
+- Syntax/whitespace checks: `bash -n tests/opencode-smoke.sh`, `node --check tests/agentbox.test.cjs`, `node --check tests/opencode-dependencies.test.cjs`, and `git diff --check` all exited **0**. `shellcheck tests/opencode-smoke.sh` exited **0** with no diagnostics.
+- A second full real smoke verified the same final counts, all seven active server plugins, all **47/39/37** configured definitions, five connected InterBase MCPs, four disabled debugger MCPs, and Meridian. No host listener was contacted.
+- The real `.env` selector-override fixture remains blocked by Safety Net (`secret.basename.env`). It was not retried or bypassed. No prompt, paid request, session mutation, Herdr RPC, credential-content access, config repair, database access/repair, host-service mutation, or live SQLite hashing occurred.
+- Self-review for this fix round is by the task implementer. The controller's independent scoped re-review is pending; this report does not claim its approval.

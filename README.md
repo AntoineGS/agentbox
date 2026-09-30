@@ -198,6 +198,10 @@ network isolation; `-p` mappings are ignored. Herdr context and its socket are
 forwarded when available. Claude networking and launch behavior are unchanged.
 
 The `--server` option conflicts with AgentBox-managed private-server execution.
+For read-only validation, run `agentbox --tool opencode shell bash tests/opencode-smoke.sh [OPTIONS]`.
+It waits for catalog initialization, verifies the reported project location,
+and prints catalog counts plus requested integration statuses—not catalog
+bodies. It sends no prompt or session-control request.
 
 ## Advanced Usage
 

@@ -101,11 +101,16 @@ $PROJECT_DIR            # Project directory (mounted at full host path)
 
 The opt-in read-only OpenCode smoke runs inside an OpenCode-selected shell:
 `agentbox --tool opencode shell bash tests/opencode-smoke.sh [OPTIONS]`.
-It checks V2 catalogs and can require plugin IDs/sources or MCP statuses with
-`--require-plugin`, `--require-mcp`, `--disabled-mcp`, and `--meridian-url`.
-It starts and cleans up only its own container-local private server; it sends
-no prompts or session-control requests. When Herdr is active, it opens the
-forwarded socket without sending RPC data or changing a pane/session.
+It waits for startup and requested readiness, refreshes all six catalogs, and
+checks that each reports the current project location. It can require plugin
+IDs/sources, agent/skill/command IDs, and MCP statuses with `--require-plugin`,
+`--require-agent`, `--require-skill`, `--require-command`, `--require-mcp`,
+`--disabled-mcp`, and `--meridian-url`. It prints catalog counts and requested
+statuses, never catalog bodies. It starts and cleans up only its own
+container-local private server, sends no prompts or session-control requests,
+and uses a temporary password for authenticated read-only HTTP GETs. When
+Herdr is active, it opens the forwarded socket without sending RPC data or
+changing a pane/session.
 
 ## Potential Future Improvements
 
