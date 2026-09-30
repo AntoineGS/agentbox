@@ -1017,6 +1017,17 @@ test('ocv is rejected before runtime access', t => {
   assert.match(result.stderr, /claude.*opencode/);
 });
 
+test('OpenCode is the default tool when none is selected', t => {
+  const f = fixture(t);
+  fs.writeFileSync(path.join(f.bin, 'opencode'), '#!/bin/sh\necho 1.0.0\n', { mode: 0o755 });
+  const env = { ...process.env, HOME: f.home, PATH: `${f.bin}:${process.env.PATH}` };
+  delete env.AGENTBOX_TOOL;
+  const result = spawnSync('bash', [path.join(repo, 'agentbox')], { cwd: f.projectDir, env, encoding: 'utf8' });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /Host OpenCode must report a V2 version/);
+  assert.match(bash(f, 'show_help').stdout, /opencode \(default\)/);
+});
+
 test('sourcing agentbox defines functions without running the CLI', t => {
   const f = fixture(t);
   const marker = path.join(f.home, 'runtime-called');

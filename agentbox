@@ -1128,7 +1128,7 @@ Usage:
 
 Options:
     -h, --help              Show this help message
-    --tool TOOL             Choose tool: claude (default) or opencode
+    --tool TOOL             Choose tool: opencode (default) or claude
     -p PORT                 Forward a port from host to container (can be used multiple times)
     --rebuild               Force rebuild of the image
     --parent                Mount parent directory instead of current directory (cwd unchanged)
@@ -1136,27 +1136,27 @@ Options:
     --ignore-dot-env        Do not load .env files as environment variables (still mounted)
 
 Commands:
-    shell [--admin]         Start interactive shell instead of Claude CLI
+    shell [--admin]         Start interactive shell instead of the selected tool
     ssh-init                Initialize SSH directory for AgentBox
 
-    If no command is provided, Claude CLI will be started automatically.
-    Use 'shell' command to get a shell instead of Claude CLI.
+    If no command is provided, the selected tool will be started automatically.
+    Use 'shell' command to get a shell instead of the selected tool.
     Use 'shell --admin' to get a shell with sudo privileges.
     Other commands will be executed inside the container.
 
 Examples:
-    agentbox                            # Start Claude CLI for current project
-    agentbox --tool opencode            # Start OpenCode instead of Claude
+    agentbox                            # Start OpenCode for current project
+    agentbox --tool claude              # Start Claude CLI instead of OpenCode
     agentbox -p 3002                    # Forward port 3002
     agentbox -p 3002:8080               # Map host port 3002 to container port 8080
-    agentbox shell                      # Start interactive shell instead of Claude
+    agentbox shell                      # Start interactive shell instead of the selected tool
     agentbox shell --admin              # Start admin shell with sudo access
     agentbox --parent                      # Mount parent dir (access sibling repos)
-    agentbox --add-dir ~/1 --add-dir ~/2  # Add dirs with Claude CLI
+    agentbox --add-dir ~/1 --add-dir ~/2  # Add dirs with the selected tool
     agentbox python script.py           # Run Python script in container
     agentbox --rebuild                  # Force rebuild image
     agentbox ssh-init                   # Set up SSH for AgentBox
-    AGENTBOX_TOOL=opencode agentbox     # Use env var to select tool
+    AGENTBOX_TOOL=claude agentbox       # Use env var to select tool
 
 Environment variables (set in ~/.agentbox/.env):
     AGENTBOX_EXTRA_HOSTS    Comma-separated host:ip pairs added to container /etc/hosts
@@ -1216,7 +1216,7 @@ main() {
     local cmd_args=()
     declare -a ports=()
     local extra_dirs=()
-    local tool="${AGENTBOX_TOOL:-claude}"
+    local tool="${AGENTBOX_TOOL:-opencode}"
     local ignore_dot_env=false
 
     while [[ $# -gt 0 ]]; do

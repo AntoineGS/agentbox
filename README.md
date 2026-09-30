@@ -50,19 +50,19 @@ Then you can go to your project directory and run (e.g.) `agentbox --tool copilo
 ## Helpful Commands
 
 ```bash
-# Start Claude CLI in container (--dangerously-skip-permissions is automatically included)
+# Start OpenCode in container (the default tool)
 agentbox
 
-# Use OpenCode instead of Claude
-agentbox --tool opencode
+# Use Claude CLI instead of OpenCode (--dangerously-skip-permissions is automatically included)
+agentbox --tool claude
 
 # Or set via environment variable
-AGENTBOX_TOOL=opencode agentbox
+AGENTBOX_TOOL=claude agentbox
 
 # Show available commands
 agentbox --help
 
-# Non-agentbox CLI flags are passed through to claude.
+# Non-agentbox CLI flags are passed through to the selected tool.
 # For example, to continue the most recent session
 agentbox -c
 
