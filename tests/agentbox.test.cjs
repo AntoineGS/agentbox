@@ -31,6 +31,7 @@ function bash(f, body, args = []) {
     cwd: f.projectDir,
     env: { ...process.env, HOME: f.home, PATH: `${f.bin}:${process.env.PATH}` },
     encoding: 'utf8',
+    timeout: f.bashTimeout,
   });
 }
 
@@ -570,6 +571,86 @@ for (const [name, target, role = 'symlink'] of [
     assert.ok(result.stderr.includes(`Missing OpenCode dependency: ${target}`), result.stderr);
   });
 }
+
+for (const terminal of [false, true]) {
+  test(`runtime alias round1 resolves ${terminal ? 'terminal' : 'ancestor'} second-stage links and protects mapped files`, t => {
+    const f = fixture(t);
+    const canonical = path.join(f.home, 'configs/opencode'); fs.mkdirSync(path.join(canonical, 'real'), { recursive: true });
+    const config = path.join(f.home, '.config/opencode'); fs.mkdirSync(path.dirname(config)); fs.symlinkSync(canonical, config);
+    const alias = '/home/agent/.config/opencode';
+    if (terminal) {
+      fs.symlinkSync(`${alias}/real/token`, path.join(canonical, 'file-middle'));
+      fs.symlinkSync(`${alias}/file-middle`, path.join(canonical, 'file-second'));
+      fs.symlinkSync(`${alias}/real/plugin.js`, path.join(canonical, 'plugin-middle.js'));
+      fs.symlinkSync(`${alias}/plugin-middle.js`, path.join(canonical, 'plugin-second.js'));
+    } else {
+      fs.symlinkSync(`${alias}/real`, path.join(canonical, 'middle'));
+      fs.symlinkSync(`${alias}/middle`, path.join(canonical, 'second'));
+    }
+    const pluginCode = "import './helper.js'; throw new Error('NEVER_EXECUTE');";
+    fs.writeFileSync(path.join(canonical, 'real/plugin.js'), pluginCode);
+    fs.writeFileSync(path.join(canonical, 'real/helper.js'), 'adjacent fixture');
+    fs.writeFileSync(path.join(canonical, 'real/package.json'), '{"name":"fixture"}');
+    fs.writeFileSync(path.join(canonical, 'real/token'), 'CREDENTIAL_FIXTURE_NEVER_PRINT');
+    const referenced = terminal ? `${alias}/file-second` : `${alias}/second/token`;
+    const pluginEntry = terminal ? `${alias}/plugin-second.js` : `${alias}/second/plugin.js`;
+    fs.writeFileSync(path.join(canonical, 'cli.json'), JSON.stringify({ plugins: [pluginEntry] }));
+    fs.writeFileSync(path.join(canonical, 'opencode.json'), JSON.stringify({ reference: `{file:${referenced}}` }));
+    const sibling = path.join(f.home, 'configs/unrelated'); fs.mkdirSync(sibling);
+    useRealDependencyHelper(f, true);
+    const result = bash(f, 'RUNTIME=runtime; declare -a output=(); build_opencode_mounts output chained_alias; printf "%s\\n" "${output[@]}"');
+    assert.equal(result.status, 0, result.stderr);
+    assert.ok(result.stdout.includes(`${canonical}/real/token:${referenced}:ro`), result.stdout);
+    for (const destination of [config, canonical, alias]) {
+      assert.ok(result.stdout.includes(`${canonical}/real/token:${destination}/real/token:ro`), result.stdout);
+    }
+    assertMountVisibleFiles(result.stdout, [[pluginEntry, pluginCode],
+      [`${alias}/${terminal ? 'real' : 'second'}/helper.js`, 'adjacent fixture'], [referenced, 'CREDENTIAL_FIXTURE_NEVER_PRINT']],
+      [f.home, '/home/agent', path.dirname(canonical), sibling]);
+    assert.doesNotMatch(result.stdout + result.stderr, /CREDENTIAL_FIXTURE_NEVER_PRINT|NEVER_EXECUTE/);
+  });
+}
+
+for (const [name, target] of [
+  ['missing', '/home/agent/.config/opencode/missing-real'],
+  ['unapproved', '/home/agent/unapproved/real'],
+]) {
+  test(`runtime alias round1 rejects a second-stage ${name} target`, t => {
+    const f = fixture(t);
+    const config = path.join(f.home, '.config/opencode'); fs.mkdirSync(config, { recursive: true });
+    fs.symlinkSync(target, path.join(config, 'middle'));
+    fs.symlinkSync('/home/agent/.config/opencode/middle', path.join(config, 'second'));
+    fs.writeFileSync(path.join(config, 'opencode.json'), JSON.stringify({ reference: '{file:/home/agent/.config/opencode/second/token}' }));
+    useRealDependencyHelper(f, true);
+    const result = bash(f, 'RUNTIME=runtime; declare -a output=(); build_opencode_mounts output bad_chain');
+    assert.notEqual(result.status, 0);
+    assert.ok(result.stderr.includes(`Missing OpenCode dependency: ${target}`), result.stderr);
+  });
+}
+
+test('runtime alias round1 terminates a cyclic approved chain with a path-only error', t => {
+  const f = fixture(t); f.bashTimeout = 5000;
+  const config = path.join(f.home, '.config/opencode'); fs.mkdirSync(config, { recursive: true });
+  fs.symlinkSync('/home/agent/.config/opencode/cycle-b', path.join(config, 'cycle-a'));
+  fs.symlinkSync('/home/agent/.config/opencode/cycle-a', path.join(config, 'cycle-b'));
+  useRealDependencyHelper(f, true);
+  const result = bash(f, 'RUNTIME=runtime; declare -a output=(); build_opencode_mounts output cycle_alias');
+  assert.equal(result.error, undefined);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /OpenCode dependency symlink cycle or limit exceeded: \/home\/agent\/\.config\/opencode\/cycle-/);
+});
+
+test('runtime alias round1 bounds growing source-link chains without relying on repeated full paths', t => {
+  const f = fixture(t); f.bashTimeout = 5000;
+  const config = path.join(f.home, 'config'); fs.mkdirSync(config);
+  fs.symlinkSync('/home/agent/.config/opencode/cycle/child', path.join(config, 'cycle'));
+  const result = bash(f, 'declare -a output=(); declare -A registry=(); ' +
+    'append_opencode_mount output "$HOME/config" /home/agent/.config/opencode ro registry; ' +
+    'append_opencode_mount output /home/agent/.config/opencode/cycle /home/agent/.config/opencode/selected ro registry');
+  assert.equal(result.error, undefined);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /OpenCode dependency symlink cycle or limit exceeded: \/home\/agent\/\.config\/opencode\/cycle/);
+});
 
 test('runtime alias discovery still rejects closure expansion beyond 32 passes', t => {
   const f = fixture(t);

@@ -497,7 +497,7 @@ build_container_cmd() {
 
 # source_ref returns the mapped path through the caller's nameref.
 # shellcheck disable=SC2034
-resolve_opencode_mount_source() {
+map_opencode_mount_source() {
     local -n source_ref="$1" source_registry_ref="$2"
     local requested destination signature longest=0
     requested=$(realpath -ms -- "$3") || return 1
@@ -510,6 +510,50 @@ resolve_opencode_mount_source() {
         fi
     done
     return 0
+}
+
+# The output nameref keeps existing host link spellings when they resolve identically.
+# shellcheck disable=SC2034
+resolve_opencode_mount_source() {
+    local -n resolved_source_ref="$1"
+    local requested mapped original_source='' original_real resolved_real candidate remaining target component
+    local restarted links=0
+    local -r max_links=40
+    local -a components=()
+    local -A source_link_seen=()
+    requested=$(realpath -ms -- "$3") || return 1
+    while :; do
+        if [[ -n "${source_link_seen[$requested]+present}" ]] || (( links > max_links )); then
+            log_error "OpenCode dependency symlink cycle or limit exceeded: $3"
+            return 1
+        fi
+        source_link_seen["$requested"]=1
+        map_opencode_mount_source mapped "$2" "$requested" || return 1
+        [[ -n "$original_source" ]] || original_source="$mapped"
+        IFS=/ read -r -a components <<< "${mapped#/}"
+        candidate=/; restarted=false
+        for component in "${components[@]}"; do
+            candidate="${candidate%/}/$component"
+            [[ -L "$candidate" ]] || continue
+            target=$(readlink -- "$candidate") || { log_error "Cannot inspect OpenCode dependency: $3"; return 1; }
+            remaining=${mapped#"$candidate"}
+            if [[ "$target" != /* ]]; then
+                local virtual_link=${requested%"$remaining"}
+                target="${virtual_link%/*}/$target"
+            fi
+            requested=$(realpath -ms -- "$target$remaining") || return 1
+            links=$((links + 1)); restarted=true
+            break
+        done
+        if [[ "$restarted" == true ]]; then continue; fi
+        resolved_source_ref="$mapped"
+        if (( links > 0 )) && [[ -e "$original_source" ]]; then
+            original_real=$(realpath -e -- "$original_source") || return 1
+            resolved_real=$(realpath -e -- "$mapped") || return 1
+            if [[ "$original_real" == "$resolved_real" ]]; then resolved_source_ref="$original_source"; fi
+        fi
+        return 0
+    done
 }
 
 append_opencode_mount() {
